@@ -30,7 +30,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CORE = ["convergence", "drift", "drift_frozen"]
-EXTRA = ["time_offset", "yaw_only", "outliers", "knock", "knock_no_detector"]
+EXTRA = ["time_offset", "time_offset_ignored", "yaw_only", "outliers", "knock",
+         "knock_no_detector"]
 
 
 def run_campaigns(binary: Path, scenarios: list[str], trials: int, output: Path, threads: int) -> None:
@@ -127,10 +128,12 @@ def report(output: Path) -> int:
         ev = drift["stats"]["change_events"]
         print(f"\nChange-detector false alarms during the slow drift: {ev['mean'] * ev['count']:.0f} "
               f"in {drift['trials']} runs.")
-        ok = drift["tracking_rate"] >= 0.95 and drift["stats"]["tracking_max_error"]["max"] < 0.3
+        # Every run must have completed, been scored over the drift window and stayed under
+        # 0.3 deg (failed runs count against it rather than being dropped).
+        ok = drift["tracked"] == drift["trials"]
         failures += not ok
         print(f"\nCriterion 2 (tracking error < 0.3 deg throughout the drift, every run): "
-              f"{verdict(ok)}")
+              f"{drift['tracked']}/{drift['trials']} -> {verdict(ok)}")
 
     # ---------------------------------------------------------------- extras
     rows = [(n, load_summary(output, n)) for n in EXTRA]
@@ -145,12 +148,17 @@ def report(output: Path) -> int:
             extra = ""
             if name == "time_offset":
                 extra = f"t_d error p50 / p95: {fmt(s['final_time_offset_error'], keys=('median', 'p95'), digits=2)} ms"
+            elif name == "time_offset_ignored":
+                extra = "2.5 ms camera lag, t_d estimation switched off"
             elif name.startswith("knock"):
                 rec = s["recovery_time"]
                 recovered = f"{rec['count']}/{r['trials']} back under 0.5 deg & 1 cm"
                 if rec["count"] > 0:
                     recovered += f" after {rec['median']:.1f} s (p50) / {rec['p95']:.1f} s (p95)"
-                extra = (f"1.5 deg / 2 cm knock at 90 s: {recovered}; error at 180 s p50 "
+                det = s.get("detection_latency", {"count": 0})
+                detected = (f"detected after {det['median']:.2f} s (p50) / {det['max']:.2f} s (max); "
+                            if det["count"] > 0 else "")
+                extra = (f"1.5 deg / 2 cm knock at 90 s: {detected}{recovered}; error at 180 s p50 "
                          f"{s['final_rotation_error']['median']:.3f} deg / "
                          f"{s['final_translation_error']['median']:.2f} cm; detector fired "
                          f"{s['change_events']['mean']:.1f}x per run")
@@ -163,10 +171,11 @@ def report(output: Path) -> int:
                   f"{fmt(s['horizon_translation_error'], keys=('median', 'p95'), digits=2)} | {extra} |")
 
     # ---------------------------------------------------------------- plot data
-    if drift is not None:
-        env = load_csv(output / "drift" / "envelope.csv")
+    env_path = output / "drift" / "envelope.csv"
+    env = load_csv(env_path) if drift is not None and env_path.exists() else []
+    if env:
         frozen_env = {}
-        if frozen is not None:
+        if frozen is not None and (output / "drift_frozen" / "envelope.csv").exists():
             frozen_env = {round(r["time_s"], 3): r for r in load_csv(output / "drift_frozen" / "envelope.csv")}
         rows_out = []
         for r in env:
@@ -202,6 +211,8 @@ def report(output: Path) -> int:
 
 
 def figures(output: Path, figdir: Path) -> None:
+    conv_summary = load_summary(output, "convergence")
+    n_conv = conv_summary["trials"] if conv_summary else 0
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -232,7 +243,7 @@ def figures(output: Path, figdir: Path) -> None:
             ax.set_yscale("log")
             ax.set_xlabel("time [s]")
             ax.set_ylabel(f"{title.lower()} [{unit}]")
-            ax.set_title(f"{title} over 50 runs (5 deg / 5 cm start)")
+            ax.set_title(f"{title} over {n_conv} runs (5 deg / 5 cm start)")
             ax.grid(True, which="both", alpha=0.3)
             ax.legend(fontsize=8)
         fig.savefig(figdir / "convergence.png", dpi=150)
@@ -260,12 +271,12 @@ def figures(output: Path, figdir: Path) -> None:
         ax.fill_between(t, [r["online_err_p50_deg"] for r in rows], [r["online_err_max_deg"] for r in rows],
                         color=blue, alpha=0.15)
         ax.plot(t, [r["online_err_p50_deg"] for r in rows], color=blue, lw=1.8, label="online (median, band to max)")
-        ax.plot(t, [r["frozen_err_p50_deg"] for r in rows], color=grey, lw=1.4, label="no random walk (median)")
+        ax.plot(t, [r["frozen_err_p50_deg"] for r in rows], color=grey, lw=1.4, label="random walk + detector off (median)")
         ax.axhline(0.3, color=orange, lw=1.2, label="target 0.3 deg")
         ax.set_ylim(0.0, 0.65)
         ax.set_xlabel("time [min]")
         ax.set_ylabel("rotation error [deg]")
-        ax.set_title("Tracking error during the drift, 50 runs")
+        ax.set_title(f"Tracking error during the drift, {drift_summary['trials'] if drift_summary else 0} runs")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
         fig.savefig(figdir / "drift_tracking.png", dpi=150)
@@ -282,7 +293,13 @@ def main() -> int:
     ap.add_argument("--skip-run", action="store_true", help="only report on existing results")
     ap.add_argument("--core-only", action="store_true", help="skip the supplementary scenarios")
     ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--figures-dir", type=Path, default=None,
+                    help="where to write the PNGs (default: results/figures for results/mc, "
+                         "else <output>/figures)")
     args = ap.parse_args()
+    # Campaigns run with cwd=ROOT, so resolve paths against the caller's directory first.
+    args.output = args.output.resolve()
+    args.binary = args.binary.resolve()
 
     if not args.skip_run:
         if not args.binary.exists():
@@ -293,7 +310,12 @@ def main() -> int:
 
     failures = report(args.output)
     if not args.no_figures:
-        figures(args.output, ROOT / "results" / "figures")
+        figdir = args.figures_dir
+        if figdir is None:
+            default_out = (ROOT / "results" / "mc").resolve()
+            figdir = ROOT / "results" / "figures" if args.output.resolve() == default_out \
+                else args.output / "figures"
+        figures(args.output, figdir)
     print(f"\nOverall: {'ALL CRITERIA MET' if failures == 0 else f'{failures} criterion/criteria not met'}")
     return 0 if failures == 0 else 1
 

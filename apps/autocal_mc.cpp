@@ -114,35 +114,42 @@ int main(int argc, char** argv) {
   std::vector<std::string> overrides;
   constexpr double kTrackingThresholdDeg = 0.3;
 
-  for (int i = 1; i < argc; ++i) {
-    const std::string a = argv[i];
-    auto next = [&]() -> std::string {
-      if (i + 1 >= argc) {
+  try {
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      auto next = [&]() -> std::string {
+        if (i + 1 >= argc) {
+          usage();
+          std::exit(2);
+        }
+        return argv[++i];
+      };
+      if (a == "--scenario") {
+        const std::string v = next();
+        names = v == "all" ? calib::scenarioNames() : split(v);
+      } else if (a == "--trials") {
+        runner.trials = std::stoi(next());
+      } else if (a == "--seed") {
+        runner.master_seed = std::stoull(next());
+      } else if (a == "--threads") {
+        runner.threads = std::stoi(next());
+      } else if (a == "--output") {
+        output = next();
+      } else if (a == "--set") {
+        overrides.push_back(next());
+      } else if (a == "--help" || a == "-h") {
         usage();
-        std::exit(2);
+        return 0;
+      } else {
+        usage();
+        return 2;
       }
-      return argv[++i];
-    };
-    if (a == "--scenario") {
-      const std::string v = next();
-      names = v == "all" ? calib::scenarioNames() : split(v);
-    } else if (a == "--trials") {
-      runner.trials = std::stoi(next());
-    } else if (a == "--seed") {
-      runner.master_seed = std::stoull(next());
-    } else if (a == "--threads") {
-      runner.threads = std::stoi(next());
-    } else if (a == "--output") {
-      output = next();
-    } else if (a == "--set") {
-      overrides.push_back(next());
-    } else if (a == "--help" || a == "-h") {
-      usage();
-      return 0;
-    } else {
-      usage();
-      return 2;
     }
+    if (runner.trials < 0 || runner.trials > 1000000) throw std::invalid_argument("--trials out of range");
+  } catch (const std::exception& e) {
+    std::cerr << "autocal_mc: bad argument (" << e.what() << ")\n";
+    usage();
+    return 2;
   }
 
   std::vector<ScenarioSummary> summaries;
@@ -169,14 +176,16 @@ int main(int argc, char** argv) {
     sum.has_tracking = cfg.tracking_start >= 0.0;
     sum.tracking_threshold_deg = kTrackingThresholdDeg;
     std::vector<double> hr, ht, fr, ft, ct, tm, tr, tt, nees, nis, td, bg, ba, wall, lm, rec,
-        events;
+        events, latency;
     std::vector<calib::TrialResult> valid;
     for (std::size_t i = 0; i < run.results.size(); ++i) {
       const auto& t = run.results[i];
       if (!run.errors[i].empty() || !t.ok) continue;
       ++sum.ok;
       if (t.converged) ++sum.converged;
-      if (sum.has_tracking && t.tracking_max_error_deg < kTrackingThresholdDeg) ++sum.tracked;
+      if (sum.has_tracking && t.tracking_samples > 0 &&
+          t.tracking_max_error_deg < kTrackingThresholdDeg)
+        ++sum.tracked;
       hr.push_back(t.horizon_rotation_error_deg);
       ht.push_back(100.0 * t.horizon_translation_error);
       fr.push_back(t.final_rotation_error_deg);
@@ -186,6 +195,15 @@ int main(int argc, char** argv) {
       tr.push_back(t.tracking_rms_error_deg);
       tt.push_back(100.0 * t.tracking_max_translation);
       if (t.recovery_time >= 0.0) rec.push_back(t.recovery_time);
+      // Detection latency: first change event at or after a scripted knock.
+      if (cfg.sim.drift.step_time >= 0.0) {
+        for (double event_time : t.change_times) {
+          if (event_time >= cfg.sim.drift.step_time - 1e-9) {
+            latency.push_back(event_time - cfg.sim.drift.step_time);
+            break;
+          }
+        }
+      }
       events.push_back(static_cast<double>(t.change_events));
       nees.push_back(t.mean_nees);
       nis.push_back(t.mean_nis_per_dof);
@@ -206,6 +224,7 @@ int main(int argc, char** argv) {
                  mc::computeStatistics("tracking_max_translation", "cm", tt),
                  mc::computeStatistics("recovery_time", "s", rec),
                  mc::computeStatistics("change_events", "-", events),
+                 mc::computeStatistics("detection_latency", "s", latency),
                  mc::computeStatistics("mean_nees", "-", nees),
                  mc::computeStatistics("mean_nis_per_dof", "-", nis),
                  mc::computeStatistics("final_time_offset_error", "ms", td),
@@ -220,19 +239,19 @@ int main(int argc, char** argv) {
     fs::create_directories(dir);
     {
       util::CsvWriter w(dir + "/trials.csv",
-                        {"index", "seed", "ok", "converged", "convergence_time_s",
+                        {"index", "ok", "converged", "convergence_time_s",
                          "horizon_rot_err_deg", "horizon_trans_err_m", "final_rot_err_deg",
                          "final_trans_err_m", "tracking_max_err_deg", "tracking_rms_err_deg",
                          "tracking_max_trans_err_m", "truth_drift_total_deg", "recovery_time_s",
                          "final_td_err_s", "final_gyro_bias_err", "final_accel_bias_err",
                          "mean_nees", "mean_nis_per_dof", "mean_landmarks_used",
-                         "frames_fused", "change_events", "static_init_ok", "wall_clock_s"});
+                         "frames_fused", "frames_dropped", "change_events", "static_init_ok",
+                         "wall_clock_s"});
       for (std::size_t i = 0; i < run.results.size(); ++i) {
         const auto& t = run.results[i];
         const bool ok = run.errors[i].empty() && t.ok;
-        w.writeRow({static_cast<double>(i), static_cast<double>(mc::trialSeed(runner.master_seed,
-                                                                              static_cast<int>(i))),
-                    ok ? 1.0 : 0.0, t.converged ? 1.0 : 0.0, t.convergence_time,
+        // Trial i is reproduced exactly by `autocal_run --seed <master_seed> --trial i`.
+        w.writeRow({static_cast<double>(i), ok ? 1.0 : 0.0, t.converged ? 1.0 : 0.0, t.convergence_time,
                     t.horizon_rotation_error_deg, t.horizon_translation_error,
                     t.final_rotation_error_deg, t.final_translation_error,
                     t.tracking_max_error_deg, t.tracking_rms_error_deg,
@@ -240,6 +259,7 @@ int main(int argc, char** argv) {
                     t.final_time_offset_error, t.final_gyro_bias_error,
                     t.final_accel_bias_error, t.mean_nees, t.mean_nis_per_dof,
                     t.mean_landmarks_used, static_cast<double>(t.frames_fused),
+                    static_cast<double>(t.frames_dropped),
                     static_cast<double>(t.change_events), t.static_init_ok ? 1.0 : 0.0,
                     t.wall_clock_seconds});
       }

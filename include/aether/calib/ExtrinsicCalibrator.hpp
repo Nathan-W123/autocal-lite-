@@ -57,10 +57,15 @@ struct CalibratorConfig {
   double init_extrinsic_translation_sigma = 0.05;                     ///< [m]
 
   // --- Camera-IMU time offset -----------------------------------------------------
-  bool estimate_time_offset = false;   ///< Add \f$t_d\f$ to the estimated state.
+  /// Estimate \f$t_d\f$ online. On by default: the lever arm is strongly coupled to timing, and
+  /// even 2.5 ms of unmodelled camera latency biases it by more than a centimetre.
+  bool estimate_time_offset = true;
   double init_time_offset = 0.0;       ///< Prior \f$t_d\f$ [s]
   double init_time_offset_sigma = 0.01;///< [s]
-  double max_time_offset = 0.05;       ///< Estimate is clamped to +-this [s]
+  /// The estimate is clamped to +-this [s]. It is a configuration bound, not a fit: it must
+  /// exceed the largest offset expected, because a clamped estimate leaves the rest of the
+  /// state inconsistent with it.
+  double max_time_offset = 0.05;
 
   // --- Change detection ("knock" recovery) -----------------------------------------
   /// Re-open the extrinsic covariance when the filter keeps being pulled in one direction
@@ -71,7 +76,7 @@ struct CalibratorConfig {
   /// and grows quadratically after a step change.
   bool detect_change = true;
   int change_window = 40;               ///< Updates in the test window (2 s at 20 Hz).
-  double change_threshold = 40.0;       ///< Threshold on T (chi^2_6 tail ~ 3e-7).
+  double change_threshold = 40.0;       ///< Threshold on T (chi^2_6 tail 4.6e-7).
   /// 1-sigma the extrinsic covariance is re-opened to when a change is detected. Sized for a
   /// knock, not for the initial CAD-level uncertainty: a much larger value makes the first
   /// updates after the reset overshoot. A bigger change simply trips the detector again.
@@ -82,6 +87,12 @@ struct CalibratorConfig {
   /// after a reset is mistaken for a knock.
   double change_arm_rotation_sigma = 0.1 * constants::kDegToRad;  ///< [rad]
   double change_arm_translation_sigma = 0.005;                    ///< [m]
+
+  /// How late a stereo frame may be delivered after its exposure [s]. The filter keeps the
+  /// newest IMU samples in a buffer and lags the newest one by this much, so a frame that
+  /// arrives late is still fused at its exact exposure time. 0 means frames must be queued
+  /// before the IMU passes their exposure (no lag). Frames later than this are dropped.
+  double max_frame_latency = 0.0;
 
   bool exact_discretisation = false;   ///< Van Loan instead of the series (Aether6 option).
 
@@ -162,12 +173,18 @@ class ExtrinsicCalibrator {
   /// \param prior  Nominal (e.g. CAD) extrinsic the filter starts from.
   ExtrinsicCalibrator(const CalibratorConfig& config, const Extrinsic& prior);
 
-  /// Feed one IMU sample (strictly increasing time). Any queued stereo frame whose exposure
-  /// time, `stamp + t_d_hat`, falls before this sample is fused at that exact time.
+  /// Feed one IMU sample (strictly increasing time). The filter then advances to
+  /// `sample.time - max_frame_latency`, fusing every queued stereo frame whose exposure time,
+  /// `stamp + t_d_hat`, it passes at that exact time.
   void addImu(const sensors::ImuSample& sample);
-  /// Queue a stereo frame (non-decreasing stamps). It must be queued before the IMU samples
-  /// that pass its exposure time; frames that arrive late are fused at the current time.
+  /// Queue a stereo frame (non-decreasing stamps). It may arrive up to `max_frame_latency`
+  /// after its exposure. A frame whose exposure lies less than half an IMU period before the
+  /// filter time is fused at the filter time; an older one is dropped (see droppedFrames()).
   void addFrame(StereoFrame frame);
+  /// Process every buffered IMU sample and the frames they pass (end of a data set).
+  void flush();
+  /// Frames exposed after the filter started that arrived too late to be fused.
+  int droppedFrames() const { return dropped_frames_; }
 
   /// Called after every fused frame.
   void setFrameCallback(std::function<void(const FrameReport&)> cb) { callback_ = std::move(cb); }
@@ -200,10 +217,12 @@ class ExtrinsicCalibrator {
 
  private:
   void initialiseFromStatic();
+  void processImuUntil(double t);
+  void stepImu(const sensors::ImuSample& sample);
   void propagate(sensors::ImuSample a, const sensors::ImuSample& b);
   void fuseFrame(const StereoFrame& frame, const Vec3& gyro_at_frame);
   void injectAndReset(const VecX& dx);
-  void cloneCurrentPose(const Vec3& omega);
+  void cloneCurrentPose(const Vec3& omega, double shift);
   void reopenExtrinsic();
   VecX yawNullDirection() const;
 
@@ -236,6 +255,10 @@ class ExtrinsicCalibrator {
   std::vector<sensors::ImuSample> init_samples_;
   sensors::ImuSample segment_start_;  ///< IMU sample (possibly interpolated) at time_.
   std::deque<StereoFrame> frames_;
+  std::deque<sensors::ImuSample> imu_buffer_;  ///< Samples not yet processed (fixed lag).
+  double last_imu_time_ = -1e300;
+  double init_time_ = 0.0;  ///< Filter start (end of the static window) [s]
+  int dropped_frames_ = 0;
 
   // Change detection.
   /// Per-update extrinsic correction and covariance reduction, for the change detector.

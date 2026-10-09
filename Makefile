@@ -37,7 +37,7 @@ test: build
 	$(BIN)/autocal_tests
 
 ctest: build
-	ctest --test-dir $(BUILD_DIR) --output-on-failure
+	cd $(BUILD_DIR) && ctest --output-on-failure
 
 run: build
 	$(BIN)/autocal_run --scenario $(SCENARIO)
@@ -46,7 +46,7 @@ monte-carlo: build
 	$(BIN)/autocal_mc --scenario all --trials $(TRIALS)
 
 eval: build
-	$(PYTHON) python/scripts/eval.py --trials $(TRIALS)
+	$(PYTHON) python/scripts/eval.py --trials $(TRIALS) --binary $(BIN)/autocal_mc
 
 clean:
 	rm -rf $(BUILD_DIR)

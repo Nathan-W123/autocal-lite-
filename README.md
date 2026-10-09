@@ -10,14 +10,18 @@ and no ground truth, only the sensor data.
 
 ## Results
 
-50 Monte-Carlo runs per scenario, with deterministic seeds (`make eval` reproduces every
-number below). Each run draws its own landmark field, truth mount (nominal ± 2° / ± 2 cm),
-IMU biases, noise, and the *direction* of the 5° / 5 cm error in the starting estimate.
+50 Monte-Carlo runs per scenario, with deterministic seeds: `make eval` reproduces every
+number below with the same standard library, here GCC 13 / libstdc++. `std::normal_distribution`
+is implementation-defined, so another standard library gives statistically equivalent but
+not identical numbers. Each run draws its own landmark field, truth mount (nominal ± 2° / ± 2 cm),
+IMU biases and noise. It also draws the *direction* of the 5° / 5 cm error in the starting
+estimate: the starting extrinsic is the hidden truth perturbed by exactly 5° and 5 cm, and it
+is the only thing the estimator receives.
 
 | criterion | target | result |
 |---|---|---|
-| **1. Converge** from 5° rotation / 5 cm translation error | < 0.5° and < 1 cm within 60 s in ≥ 95 % of 50 runs | **50 / 50 runs (100 %)**. Error at 60 s, p95: **0.023° / 0.32 cm** (worst run 0.026° / 0.44 cm). Median time to converge 5.8 s (p95 11.6 s) |
-| **2. Track drift**: after convergence the true mount rotates at 0.1°/min for 10 min (1° total) | tracking error < 0.3° | **50 / 50 runs**. Worst tracking error over the 10 min: **0.060°** (p95 0.056°, RMS 0.024°). The same filter without the extrinsic random walk falls behind: 0.55° after 10 min and still diverging (0 / 50 pass) |
+| **1. Converge** from 5° rotation / 5 cm translation error | < 0.5° and < 1 cm within 60 s in ≥ 95 % of 50 runs | **50 / 50 runs (100 %)**. Error at 60 s, p95: **0.023° / 0.31 cm** (worst run 0.026° / 0.44 cm). Median time to converge 5.8 s (p95 11.7 s) |
+| **2. Track drift**: after convergence the true mount rotates at 0.1°/min for 10 min (1° total) | tracking error < 0.3° | **50 / 50 runs**. Worst tracking error over the 10 min: **0.060°** (p95 0.056°, RMS 0.024°). The same filter with the random walk and the change detector switched off falls behind: 0.55° after 10 min and still diverging (0 / 50 pass) |
 
 ![Drift tracking](results/figures/drift_tracking.png)
 
@@ -25,18 +29,20 @@ Supplementary scenarios (same 50 seeds):
 
 | scenario | what changes | result |
 |---|---|---|
-| `time_offset` | camera clock 8 ms off the IMU clock, estimated online | 50 / 50 converge; t_d recovered to 0.03 ms (p50), 0.07 ms (p95) |
-| `outliers` | 5 % of the correspondences are wrong | 50 / 50 converge (p95 0.026° / 0.31 cm); the per-landmark χ² gate removes them |
-| `knock` | the mount is knocked by 1.5° / 2 cm at t = 90 s | the change detector fires once in every run; back under 0.5° and 1 cm after 3.4 s (p50) / 8.7 s (p95); 0.012° / 0.15 cm at 180 s |
-| `knock_no_detector` | same knock, detector off | the random walk recovers the rotation but not the lever arm: 1.05 cm still off at 180 s (7 / 50 back under 1 cm) |
+| `time_offset` | camera clock 8 ms off the IMU clock (t_d is estimated in every scenario) | 50 / 50 converge; t_d recovered to 0.02 ms (p50), 0.06 ms (p95) |
+| `time_offset_ignored` | camera lags 2.5 ms but the filter assumes perfect sync | **4 / 50 converge**: the lever arm absorbs the lag (1.5 cm p50 error). The change detector flags the misfit, firing ~6× per run. This is why t_d is always estimated |
+| `outliers` | 5 % of the correspondences are wrong | 50 / 50 converge (p95 0.025° / 0.32 cm); the per-landmark χ² gate removes them |
+| `knock` | the mount is knocked by 1.5° / 1.95 cm at t = 90 s | the change detector fires exactly once in every run, 0.30 s after the knock (p50; 0.40 s worst). Back under 0.5° and 1 cm after 3.5 s (p50) / 8.8 s (p95), 0.013° / 0.15 cm at 180 s. The rotation error never exceeds the knock; the lever arm overshoots to 3.0 cm (p50) for a few seconds |
+| `knock_no_detector` | same knock, detector off | the random walk recovers the rotation but not the lever arm: still 1.05 cm off at 180 s (6 / 50 back under 1 cm) |
 | `yaw_only` | roll and pitch excitation removed | 6 / 50 converge: the lever arm along the yaw axis is unobservable (2.4 cm p50 error), exactly as the theory predicts |
-| false alarms | change detector on every run above without a knock | **0 in 250 runs** (≈ 12 h of simulated data) |
+| false alarms | change detector in every run where it is armed and the model is right (`convergence`, `drift`, `time_offset`, `outliers`) | **0 in 200 runs** (≈ 11.7 h of simulated data). In `yaw_only` it never arms, because the filter knows its lever arm has not converged |
 
-The extrinsic covariance is reported alongside every estimate. The vision NIS is 1.00 per
-degree of freedom, so the noise model matches the data, and the extrinsic NEES is 2.0
-(6 = consistent): the filter is **conservative** by about 1.4× in σ, for a known reason
-([docs/method.md §8](docs/method.md#8-consistency-honestly)). A 60 s run takes 0.95 s of
-wall-clock time on one core.
+Every frame is delivered to the estimator 30 ms after its exposure; no frame was dropped in
+any run. The extrinsic covariance is reported alongside every estimate. The vision NIS is
+1.00 per degree of freedom, so the noise model matches the data. The extrinsic NEES is 2.0
+(6 = consistent): the filter is **conservative** by about √(6/2.0) ≈ 1.7× in σ, for a known
+reason ([docs/method.md §8](docs/method.md#8-consistency-honestly)). A 60 s run takes 0.97 s
+of wall-clock time on one core.
 
 ## The problem
 
@@ -48,12 +54,18 @@ normal operation**:
 
 * **Input.** 200 Hz IMU samples and 20 Hz stereo frames with feature correspondences (the
   front end is out of scope; correspondences are provided, 0.5 px noise). Known intrinsics and
-  a 12 cm baseline. A nominal "CAD" extrinsic that is wrong by 5° and 5 cm.
+  a 12 cm baseline. A nominal ("CAD") extrinsic that is wrong by 5° and 5 cm (generated per
+  run as described above).
 * **Not input.** Landmark positions (there is no target), the trajectory, the true extrinsic,
   or any other ground truth. The estimator initialises itself from a 1.5 s stationary IMU
   window.
-* **Output.** The extrinsic with a covariance, the IMU biases, and optionally the camera-IMU
-  time offset, updated at every frame.
+* **Output.** The extrinsic with a covariance, the IMU biases and the camera-IMU time offset,
+  updated at every frame. The time offset is estimated in every scenario, even when its true
+  value is 0, because the lever arm is very sensitive to timing: an unmodelled 2.5 ms camera
+  lag alone biases it by 1.5 cm (`time_offset_ignored` below).
+* **Delivery.** Each stereo frame reaches the estimator 30 ms after its exposure, as from a
+  camera driver. The filter runs 80 ms behind the newest IMU sample, so every frame is still
+  fused at its exact exposure time.
 
 ## How it works
 
@@ -89,10 +101,17 @@ logic, and a candid consistency analysis) is in [docs/method.md](docs/method.md)
 
 The tree mirrors [Aether6](https://github.com/Nathan-W123/Aether6)'s layout (`include/aether/…`,
 `src/…`, `apps/`, `tests/`, same CMake/Makefile/CI and namespaces), so the module is laid out
-to be merged back. Going into the Aether6 tree means adding `calib/`, the two small extracted
-core pieces (`estimation/EskfCore`, `sensors/Imu`) and the generic `mc::runCampaign` next to
-Aether6's existing files, plus the `Vec2` alias in `core/Types.hpp`. Files taken from Aether6
-(MIT, commit `6b8dc56`) say so in their header.
+to be merged back. It is not a copy-in drop, though. Merging it into the Aether6 tree means:
+
+* adding `calib/` and `estimation/EskfCore`;
+* making `sensors/Imu.hpp` include `ImuConfig`/`ImuSample` from Aether6's
+  `sensors/Sensors.hpp` instead of redefining them (Aether6's `SensorSuite` could then delegate
+  its IMU branch to `ImuModel`);
+* adding `mc::runCampaign`/`trialSeed` to Aether6's existing `mc/MonteCarlo.hpp`, whose
+  aircraft-specific runner keeps the same file;
+* adding the `Vec2` alias to `core/Types.hpp`.
+
+Files taken from Aether6 (MIT, commit `6b8dc56`) say so in their header.
 
 | | what | where |
 |---|---|---|
@@ -123,8 +142,9 @@ make eval       # 50-run campaigns for every scenario, then prints the convergen
 ```
 
 `python3 python/scripts/eval.py --skip-run` re-prints the tables from the committed
-`results/mc/` without re-running anything. The apps take `--help`. Any parameter can be
-swept from the command line, for example:
+`results/mc/` without re-running anything. The apps take `--help`. The parameters listed in
+`calib::applyOverride` (`include/aether/calib/Campaign.hpp`) can be overridden from the
+command line, for example:
 
 ```bash
 ./build/bin/autocal_run --scenario drift --set rot_walk=5e-5
@@ -132,7 +152,8 @@ swept from the command line, for example:
 ```
 
 Scenarios: `convergence`, `drift`, `drift_frozen`, `knock`, `knock_no_detector`,
-`time_offset`, `yaw_only`, `outliers`.
+`time_offset`, `time_offset_ignored`, `yaw_only`, `outliers`. `autocal_run --trial I`
+reproduces trial `I` of a campaign exactly.
 
 ## Layout
 
@@ -152,27 +173,30 @@ results/                committed campaign outputs and figures
 AutoCal's hard problem is an extrinsic calibration that stays right without targets or
 experts. This prototype runs that whole loop end to end and measures it. The scene itself is
 the target: landmarks are triangulated and marginalised on the fly and never surveyed. The
-rig initialises itself from 1.5 s of stillness and pulls a CAD-level 5° / 5 cm error down to
-0.02° / 3 mm in every one of 50 randomised runs, typically within 6 s. Because the extrinsic is
+rig initialises itself from 1.5 s of stillness and pulls a CAD-level 5° / 5 cm error below
+0.03° / 5 mm in every one of 50 randomised runs (median 0.015° / 1.5 mm), typically
+converging within 6 s. Because the extrinsic is
 modelled as a slowly varying state with a covariance, not a constant measured once, the
 same filter holds a mount that drifts 1° in 10 minutes to within 0.06°, where a filter that
 treats the mount as fixed ends 0.55° off and keeps diverging. When the hardware is knocked, a
-χ² test on the filter's own corrections notices within a few hundred milliseconds, and the
-calibration re-converges in seconds with no operator. That is the "never recalibrate again"
+χ² test on the filter's own corrections notices within 0.4 s, and the calibration
+re-converges in seconds with no operator. That is the "never recalibrate again"
 behaviour, in miniature. What makes it trustworthy rather than a demo is what AutoCal needs
 at scale: analytic Jacobians checked against numerical ones, a noise-free regression test
 that catches simulator/estimator timing mismatches, consistency statistics reported next to
-accuracy, zero false change alarms across 250 runs, and an observability ablation that shows
-which motions the calibration needs. Growing it toward AutoCal means adding states and
+accuracy, zero false change alarms across 200 armed runs, and an observability ablation that
+shows which motions the calibration needs. Growing it toward AutoCal means adding states and
 sensors (intrinsics, more cameras, LiDAR), not changing the approach.
 
 ## Scope and limitations
 
 This is a prototype on simulated data, not a product. The camera is an ideal rectified
-pinhole pair: no lens distortion, no rolling shutter, known intrinsics. Correspondences are
-given rather than detected. Only stereo + IMU is calibrated. The motion is a deliberately
-exciting figure-eight. The filter's covariance is conservative by roughly 1.5× in σ
-([docs/method.md §8](docs/method.md#8-consistency-honestly) explains why and what it would
-cost to remove). The natural next steps toward AutoCal are camera intrinsics in the state,
+pinhole pair: no lens distortion, no rolling shutter, known intrinsics. The estimator is
+given the simulator's true noise parameters (IMU noise densities and random walks, pixel σ);
+with real sensors they would come from an Allan-variance characterisation and would be
+inflated somewhat. Correspondences are given rather than detected. Only stereo + IMU is
+calibrated. The motion is a deliberately exciting figure-eight. The filter's covariance is
+conservative by roughly 1.7× in σ ([docs/method.md §8](docs/method.md#8-consistency-honestly)
+explains why and what it would cost to remove). The natural next steps toward AutoCal are camera intrinsics in the state,
 real data with a feature front end, more sensor pairs (LiDAR-camera, multi-camera), and an
 excitation monitor that tells the operator when the motion is not informative enough.

@@ -11,8 +11,10 @@ forward-right-down, camera frame x-right / y-down / z-optical-axis. Every rotati
 Recover the rigid transform `T_IC = (R_IC, p_IC)` of the left camera in the IMU frame (and,
 optionally, the camera-IMU clock offset `t_d`) from a stereo/IMU stream alone. The intrinsics
 and stereo baseline are known; the landmarks are **not** (no target), and nothing about the
-truth trajectory or the truth extrinsic reaches the estimator. The estimator is given a
-nominal mount that is wrong by 5° and 5 cm.
+truth trajectory or the truth extrinsic reaches the estimator. It starts from a nominal
+("CAD") mount that is wrong by 5° and 5 cm. In the evaluation this starting value is made by
+perturbing each run's hidden truth by exactly 5° and 5 cm in a random direction, so that the
+initial error is controlled precisely. The estimator only ever receives the perturbed value.
 
 ## 2. State
 
@@ -100,6 +102,17 @@ the 5-dimensional left null space `N` of `H_f` (the last five columns of its Hou
 `N` is orthonormal, so isotropic pixel noise stays isotropic. This is the MSCKF trick
 applied to a two-pose window, and it is why the landmarks never need to enter the state.
 
+**Timing.** The time offset is estimated in every scenario. The lever arm is so tightly
+coupled to timing that an unmodelled 2.5 ms camera lag biases it by 1.5 cm and breaks
+convergence (`time_offset_ignored`). Two details keep the timing exact:
+* When an update moves `t̂_d` by `Δ`, the filter time (the exposure as estimated *before* the
+  update) is off by `Δ`. The clone is therefore re-timed to `stamp + t̂_d` (pose shifted by
+  `(ω̂Δ, v̂Δ)`) before it becomes the next anchor.
+* Frames may be delivered after their exposure, as from a real driver. The filter keeps a
+  short IMU buffer and runs `max_frame_latency` behind the newest sample, so a late frame is
+  still fused at its exposure time. The evaluation delivers every frame 30 ms late with an
+  80 ms lag, and the results are bit-identical to on-time delivery (`tests/test_calibrator.cpp`).
+
 **Robustness.** Each landmark's 5-dof residual is gated at χ²(5, 99.9 %) = 20.5 against
 `S = H P Hᵀ + σ²I`, which removes wrong correspondences.
 
@@ -133,16 +146,19 @@ keeps a large σ along the yaw axis and the lever-arm error there stays near its
 **Slow drift.** A random-walk model with intensity `q` and measurement information rate `J`
 has a steady-state time constant `τ ≈ 1/√(qJ)` and noise `σ² ≈ √(q/J)`. A mount drifting at a
 constant rate `ṙ` is followed with a lag of about `ṙ τ`. The rotation intensity was picked by
-sweeping it on the drift scenario (20 runs per value, max tracking error p95 / extrinsic NEES):
+sweeping it on the drift scenario with the final configuration (20 runs per value):
 
 | `extrinsic_rotation_walk` [rad/√s] | 1e-5 | 2e-5 | 5e-5 | **1e-4** | 2e-4 |
 |---|---|---|---|---|---|
-| max tracking error p95 [deg] | 0.210 | 0.116 | 0.063 | **0.053** | 0.064 |
-| RMS tracking error p50 [deg] | 0.160 | 0.091 | 0.040 | **0.025** | 0.024 |
-| mean NEES (6 = consistent) | 594 | 97 | 8.9 | **2.9** | 2.0 |
-| rotation error at 60 s p95 [deg] | 0.015 | 0.016 | 0.017 | **0.023** | 0.034 |
+| max tracking error p95 [deg] | 0.823 | 0.116 | 0.063 | **0.053** | 0.064 |
+| RMS tracking error p50 [deg] | 0.122 | 0.091 | 0.040 | **0.025** | 0.024 |
+| mean NEES (6 = consistent) | 373 | 97 | 8.9 | **2.9** | 2.0 |
+| rotation error at 60 s p95 [deg] | 0.016 | 0.016 | 0.017 | **0.023** | 0.033 |
+| runs tracked within 0.3° | 1 / 20 | 20 / 20 | 20 / 20 | **20 / 20** | 20 / 20 |
 
-Below 1e-4 the filter lags the drift and becomes over-confident (NEES ≫ 6). Above it, noise
+Below 1e-4 the filter lags the drift and becomes over-confident (NEES ≫ 6). At 1e-5 the drift
+is so far outside the model that the change detector takes it for a knock and re-opens the
+covariance in every run, and the error spikes while the filter re-converges. Above 1e-4 noise
 dominates. At 1e-4 the drift is fully explained by the model: NEES matches the stationary
 case, and the converged accuracy on a stationary mount barely changes.
 
@@ -150,10 +166,13 @@ case, and the converged accuracy on a stationary mount barely changes.
 residual it barely shows in the NIS: an extrinsic error only reveals itself through the
 rig's motion over 50 ms. The detector therefore looks at the extrinsic directly. Over the last
 `W` updates (40 = 2 s), the summed extrinsic corrections `Δ = Σ K_i ν_i` of a consistent
-filter have covariance `C = Σ (P⁻_i − P⁺_i)`, because the innovations are white. So
-`T = Δᵀ C⁻¹ Δ ~ χ²₆` while the mount behaves as modelled. After a step the filter is dragged
+filter with white innovations would have covariance `C = Σ (P⁻_i − P⁺_i)`, and
+`T = Δᵀ C⁻¹ Δ` would be χ²₆ while the mount behaves as modelled. Here the innovations of
+consecutive pairs are slightly (negatively) correlated and the filter is conservative (§8),
+so `T` is a well-scaled heuristic rather than an exact χ²₆ test, and its threshold is
+validated empirically (no false alarms, below). After a step the filter is dragged
 in one direction update after update and `T` grows quadratically. When `T > 40` (a χ²₆ tail
-probability of ~3·10⁻⁷), the extrinsic covariance is re-opened (correlations dropped,
+probability of 4.6·10⁻⁷), the extrinsic covariance is re-opened (correlations dropped,
 σ = 1° / 1 cm) and the filter re-converges to the new mount within seconds.
 
 Two details keep it quiet when nothing has happened:
@@ -164,11 +183,15 @@ Two details keep it quiet when nothing has happened:
   `t_d` was still settling.
 * The re-open size is matched to a knock, not to the CAD prior. Re-opening to 5° / 5 cm made
   the first updates overshoot: up to 3.8° of rotation error after a 1.5° knock. With
-  1° / 1 cm the error never exceeds the knock itself, and a 5° / 5 cm knock still recovers in
-  5.3 s (p50).
+  1° / 1 cm the rotation error never exceeds the knock itself. The lever arm still overshoots
+  for a few seconds (3.0 cm p50 for a 1.95 cm knock) while the rotation settles. A 5° / 5 cm
+  knock recovers in 5.3 s (p50).
 
 Because the filter is conservative, `T` sits below its nominal χ²₆ distribution on an
-undisturbed mount. There were no false alarms in 250 knock-free runs (README).
+undisturbed mount. There were no false alarms in the 200 runs where it was armed and the
+model was right (README). When the model is *wrong* it fires repeatedly: in
+`time_offset_ignored` (an unmodelled 2.5 ms camera lag) it fires ~6 times per run. That is
+the behaviour a self-checking calibrator should have.
 
 ## 8. Consistency, honestly
 

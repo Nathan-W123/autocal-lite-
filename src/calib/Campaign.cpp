@@ -45,7 +45,10 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
   prior.q_ic = math::boxPlus(truth0.q_ic, config.prior_rotation_error * randomUnitVector(rng_prior));
   prior.p_ic = truth0.p_ic + config.prior_translation_error * randomUnitVector(rng_prior);
 
-  ExtrinsicCalibrator calibrator(config.calib, prior);
+  CalibratorConfig calib_config = config.calib;
+  calib_config.max_frame_latency =
+      std::max(calib_config.max_frame_latency, config.frame_delivery_latency + 0.05);
+  ExtrinsicCalibrator calibrator(calib_config, prior);
 
   std::vector<FrameScore> scores;
   scores.reserve(static_cast<std::size_t>(sim.frameCount()));
@@ -81,7 +84,9 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
       ++nees_count;
     }
 
-    if (!horizon_recorded && rep.time >= config.convergence_horizon - 1e-9) {
+    // Errors "at the horizon" are those of the last frame fused at or before it. (With a
+    // camera-IMU time offset the last exposure can fall a few ms short of the horizon.)
+    if (rep.time <= config.convergence_horizon + 1e-9) {
       result.horizon_rotation_error_deg = rot_deg;
       result.horizon_translation_error = trans;
       horizon_recorded = true;
@@ -124,16 +129,20 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
     }
   });
 
-  // --- Stream the data through the estimator in time order ---------------------------
+  // --- Stream the data in arrival order: IMU samples as they are measured, each stereo
+  // frame `frame_delivery_latency` after its exposure ------------------------------------
   int k = 0;
   for (int i = 0; i < sim.imuCount(); ++i) {
     const double t = sim.imuTime(i);
-    while (k < sim.frameCount() && sim.frameStamp(k) <= t + config.frame_lookahead) {
+    while (k < sim.frameCount() && sim.captureTime(k) + config.frame_delivery_latency <= t) {
       calibrator.addFrame(sim.frame(k));
       ++k;
     }
     calibrator.addImu(sim.imu(i));
   }
+  while (k < sim.frameCount()) calibrator.addFrame(sim.frame(k++));  // still in flight at the end
+  calibrator.flush();
+  result.frames_dropped = calibrator.droppedFrames();
 
   // --- Scores --------------------------------------------------------------------------
   const Extrinsic est = calibrator.extrinsic();
@@ -149,37 +158,40 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
   result.mean_landmarks_used = nis_count > 0 ? used_sum / nis_count : 0.0;
   result.change_events = calibrator.changeEvents();
   result.static_init_ok = calibrator.staticInitPassed();
-  if (!horizon_recorded) {
-    result.horizon_rotation_error_deg = result.final_rotation_error_deg;
-    result.horizon_translation_error = result.final_translation_error;
-  }
+  // A run shorter than the horizon cannot certify convergence "within the horizon".
+  const bool horizon_covered =
+      horizon_recorded && config.sim.duration >= config.convergence_horizon - 1e-9;
+  result.tracking_samples = track_count;
   if (track_count > 0) {
     result.tracking_rms_error_deg = std::sqrt(track_sq / track_count);
     result.tracking_max_error_deg = track_max;
     result.tracking_max_translation = track_max_t;
   }
 
-  // Convergence time: start of the last unbroken run of below-threshold frames that reaches
-  // the horizon.
   const double rth = config.rotation_threshold_deg;
   const double tth = config.translation_threshold;
-  result.converged = result.horizon_rotation_error_deg < rth &&
-                     result.horizon_translation_error < tth;
-  if (result.converged) {
-    double t_conv = 0.0;
-    for (const auto& s : scores) {
-      if (s.time > config.convergence_horizon + 1e-9) break;
-      if (!(s.rot_deg < rth && s.trans < tth)) t_conv = s.time;
+  const auto good = [&](const FrameScore& s) { return s.rot_deg < rth && s.trans < tth; };
+  // Start of the last unbroken run of below-threshold frames in [from, until]: the time of
+  // the first frame after the last failing one (or `from` if none failed).
+  const auto settledSince = [&](double from, double until) {
+    double t = from;
+    for (std::size_t i = 0; i < scores.size(); ++i) {
+      if (scores[i].time < from - 1e-9) continue;
+      if (scores[i].time > until + 1e-9) break;
+      if (!good(scores[i])) t = i + 1 < scores.size() ? scores[i + 1].time : scores[i].time;
     }
-    result.convergence_time = t_conv;
-  }
+    return t;
+  };
 
-  if (config.tracking_start >= 0.0 && result.final_rotation_error_deg < rth &&
+  result.converged = horizon_covered && result.horizon_rotation_error_deg < rth &&
+                     result.horizon_translation_error < tth;
+  if (result.converged)
+    result.convergence_time = settledSince(0.0, config.convergence_horizon);
+
+  if (config.tracking_start >= 0.0 && track_count > 0 && result.final_rotation_error_deg < rth &&
       result.final_translation_error < tth) {
-    double t_rec = config.tracking_start;
-    for (const auto& s : scores)
-      if (s.time >= config.tracking_start && !(s.rot_deg < rth && s.trans < tth)) t_rec = s.time;
-    result.recovery_time = t_rec - config.tracking_start;
+    result.recovery_time =
+        settledSince(config.tracking_start, scores.back().time) - config.tracking_start;
   }
 
   result.ok = std::isfinite(result.final_rotation_error_deg) &&
@@ -190,8 +202,8 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
 }
 
 std::vector<std::string> scenarioNames() {
-  return {"convergence", "drift",       "drift_frozen", "knock", "knock_no_detector",
-          "time_offset", "yaw_only",    "outliers"};
+  return {"convergence", "drift",    "drift_frozen", "knock",
+          "knock_no_detector", "time_offset", "time_offset_ignored", "yaw_only", "outliers"};
 }
 
 TrialConfig scenario(const std::string& name) {
@@ -223,7 +235,11 @@ TrialConfig scenario(const std::string& name) {
   } else if (name == "time_offset") {
     c.sim.duration = 60.0;
     c.sim.time_offset = 0.008;
-    c.calib.estimate_time_offset = true;
+  } else if (name == "time_offset_ignored") {
+    // Assume the clocks are synchronised when the camera actually lags by 2.5 ms.
+    c.sim.duration = 60.0;
+    c.sim.time_offset = 0.0025;
+    c.calib.estimate_time_offset = false;
   } else if (name == "yaw_only") {
     c.sim.duration = 60.0;
     c.sim.trajectory.euler_amplitude = Vec3(0.0, 0.0, 0.45);
@@ -247,6 +263,7 @@ void applyOverride(TrialConfig* c, const std::string& assignment) {
   } catch (const std::exception&) {
     throw std::invalid_argument("override '" + assignment + "' has a non-numeric value");
   }
+  if (!std::isfinite(v)) throw std::invalid_argument("override '" + assignment + "' is not finite");
   if (key == "duration") {
     c->sim.duration = v;
   } else if (key == "prior_rot_deg") {
@@ -262,6 +279,7 @@ void applyOverride(TrialConfig* c, const std::string& assignment) {
   } else if (key == "trans_walk") {
     c->calib.extrinsic_translation_walk = v;
   } else if (key == "landmarks") {
+    if (!(v >= 0.0 && v <= 1e6)) throw std::invalid_argument("landmarks must be in [0, 1e6]");
     c->sim.scene.landmarks = static_cast<int>(v);
   } else if (key == "camera_rate") {
     c->sim.camera_rate = v;
@@ -286,6 +304,7 @@ void applyOverride(TrialConfig* c, const std::string& assignment) {
   } else if (key == "reopen_trans_m") {
     c->calib.reopen_translation_sigma = v;
   } else if (key == "change_window") {
+    if (!(v >= 1.0 && v <= 1e6)) throw std::invalid_argument("change_window must be in [1, 1e6]");
     c->calib.change_window = static_cast<int>(v);
   } else if (key == "drift_rate_deg_per_min") {
     c->sim.drift.rotation_rate = v * constants::kDegToRad / 60.0;
@@ -327,6 +346,8 @@ void applyOverride(TrialConfig* c, const std::string& assignment) {
       c->sim.imu.accel_bias_walk = 0.0;
       c->sim.pixel_noise = 0.0;
     }
+  } else if (key == "frame_latency") {
+    c->frame_delivery_latency = v;
   } else if (key == "series_interval") {
     c->series_interval = v;
   } else {

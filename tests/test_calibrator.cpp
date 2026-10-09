@@ -50,14 +50,16 @@ struct NoOp {
   void operator()(Args&&...) const {}
 };
 
-/// Stream a simulated run through a calibrator in time order, exactly as `calib::runTrial`
-/// does: every frame whose camera stamp is at most `frame_lookahead` ahead of the next IMU
-/// sample is queued first, then the sample is added. `on_frame(k, frame)` sees frame \a k
-/// before it is queued; `after_imu(i)` runs after IMU sample \a i.
+/// Stream a simulated run through a calibrator in time order, in the zero-latency mode
+/// (`max_frame_latency` = 0, the CalibratorConfig default, so the filter state is always at the
+/// newest IMU sample): every frame whose camera stamp is at most 0.1 s ahead of the next IMU
+/// sample is queued first, then the sample is added. (`calib::runTrial` instead delivers each
+/// frame after its exposure and lets the filter lag the IMU.) `on_frame(k, frame)` sees frame
+/// \a k before it is queued; `after_imu(i)` runs after IMU sample \a i.
 template <typename AfterImu = NoOp, typename OnFrame = NoOp>
 void streamRun(CalibSimulator& sim, ExtrinsicCalibrator& cal, AfterImu&& after_imu = AfterImu{},
                OnFrame&& on_frame = OnFrame{}) {
-  const double lookahead = TrialConfig{}.frame_lookahead;
+  constexpr double lookahead = 0.1;
   int k = 0;
   for (int i = 0; i < sim.imuCount(); ++i) {
     const double t = sim.imuTime(i);
@@ -302,8 +304,12 @@ TEST_CASE("a trial is reproducible bit for bit from its seed", "[calib][montecar
 
 TEST_CASE("the error covariance stays symmetric and positive semi-definite after every frame",
           "[calib][covariance]") {
+  // Both with the time offset estimated (the default) and with it fixed.
+  const bool estimate_td = GENERATE(true, false);
+  INFO("estimate_time_offset = " << estimate_td);
   TrialConfig cfg = calib::scenario("convergence");
   cfg.sim.duration = 15.0;
+  cfg.calib.estimate_time_offset = estimate_td;
   CalibSimulator sim(cfg.sim, 11);
   ExtrinsicCalibrator cal(cfg.calib, offsetPrior(sim.truthExtrinsic(0.0), 5.0 * kDeg, 0.05));
 
@@ -329,14 +335,23 @@ TEST_CASE("the error covariance stays symmetric and positive semi-definite after
   });
   streamRun(sim, cal);
 
-  REQUIRE(frames == 271);           // frames at 1.5, 1.55, ..., 15.0 s
+  // Frames at 1.5, 1.55, ..., 15.0 s. When t_d is estimated, the last frame's estimated
+  // exposure, 15.0 s + t_d_hat, can fall a hair after the final IMU sample (t_d_hat ends at
+  // +-1e-6 s depending on the compiler's floating point), and then it is legitimately not
+  // fused yet.
+  if (estimate_td) {
+    REQUIRE(frames >= 270);
+    REQUIRE(frames <= 271);
+  } else {
+    REQUIRE(frames == 271);
+  }
   REQUIRE(updates > frames * 9 / 10);  // the update path was exercised on most frames
   CHECK(non_finite == 0);
   // symmetrize() after propagation and after cloning makes P exactly symmetric; allow
   // rounding only.
   CHECK(worst_asymmetry <= 1e-14);
-  // P is singular by construction (the clone duplicates the current pose, the time offset is
-  // not estimated), so its smallest eigenvalues are 0 up to the eigen-solver's rounding,
+  // P is singular by construction (the clone duplicates the current pose, and the time offset
+  // has zero variance when it is not estimated), so its smallest eigenvalues are 0 up to the eigen-solver's rounding,
   // eps * ||P|| ~ 2e-16 * 0.02 ~ 5e-18 here. -1e-12 still catches any real loss of
   // definiteness, which would show up at the scale of the smallest variances (~1e-7).
   INFO("most negative eigenvalue " << worst_eigenvalue << " at t = " << worst_eigenvalue_time);
@@ -344,8 +359,10 @@ TEST_CASE("the error covariance stays symmetric and positive semi-definite after
 
   // Not estimated: the time offset keeps zero variance and its prior value.
   const MatX& P = cal.covariance();
-  CHECK(P(ExtrinsicCalibrator::kIdxTimeOffset, ExtrinsicCalibrator::kIdxTimeOffset) == 0.0);
-  CHECK(cal.timeOffset() == 0.0);
+  if (!estimate_td) {
+    CHECK(P(ExtrinsicCalibrator::kIdxTimeOffset, ExtrinsicCalibrator::kIdxTimeOffset) == 0.0);
+    CHECK(cal.timeOffset() == 0.0);
+  }
   // Information was actually gained on the extrinsic (prior: 5 deg / 5 cm per axis).
   const Eigen::Matrix<double, 6, 1> sigma = cal.extrinsicCovariance().diagonal().cwiseSqrt();
   CHECK(sigma.head<3>().maxCoeff() < 0.2 * kDeg);
@@ -510,6 +527,69 @@ TEST_CASE("an 8 ms camera-IMU time offset is estimated to better than 1 ms withi
 // -------------------------------------------------------------------------------------------
 // Change detection
 // -------------------------------------------------------------------------------------------
+
+TEST_CASE("frames delivered after their exposure are still fused at their exposure time",
+          "[calib][latency]") {
+  // runTrial hands each frame to the calibrator `frame_delivery_latency` after its exposure
+  // and runs the filter that far (+50 ms) behind the newest IMU sample. The filter performs
+  // the same sequence of propagations and updates whatever the delivery delay, so the
+  // results must be bit-identical.
+  TrialConfig cfg = calib::scenario("convergence");
+  cfg.sim.duration = 20.0;
+  cfg.frame_delivery_latency = 0.0;
+  const TrialResult prompt = calib::runTrial(cfg, 4);
+  cfg.frame_delivery_latency = 0.08;
+  const TrialResult late = calib::runTrial(cfg, 4);
+  REQUIRE(prompt.ok);
+  REQUIRE(late.ok);
+  CHECK(prompt.frames_dropped == 0);
+  CHECK(late.frames_dropped == 0);
+  CHECK(late.frames_fused == prompt.frames_fused);
+  CHECK(late.final_rotation_error_deg == prompt.final_rotation_error_deg);
+  CHECK(late.final_translation_error == prompt.final_translation_error);
+
+  // A frame that arrives later than max_frame_latency cannot be fused and is counted.
+  TrialConfig manual = calib::scenario("convergence");
+  manual.sim.duration = 6.0;
+  CalibSimulator sim(manual.sim, 4);
+  calib::CalibratorConfig cc = manual.calib;
+  cc.max_frame_latency = 0.02;
+  ExtrinsicCalibrator cal(cc, sim.truthExtrinsic(0.0));
+  int updates = 0;
+  cal.setFrameCallback([&](const FrameReport& rep) { updates += rep.updated ? 1 : 0; });
+  int k = 0;
+  for (int i = 0; i < sim.imuCount(); ++i) {
+    const double t = sim.imuTime(i);
+    while (k < sim.frameCount() && sim.captureTime(k) + 0.05 <= t) cal.addFrame(sim.frame(k++));
+    cal.addImu(sim.imu(i));
+  }
+  cal.flush();
+  CHECK(updates == 0);
+  CHECK(cal.droppedFrames() > 0);
+}
+
+TEST_CASE("convergence is scored at the last frame before the horizon and needs data up to it",
+          "[calib][scoring]") {
+  // With the camera lagging by 2.5 ms the last exposure is fused at ~59.9975 s, a few ms
+  // short of the 60 s horizon; it must still be scored (a regression: requiring a frame at or
+  // after the horizon silently marked every such run "not converged").
+  TrialConfig cfg = calib::scenario("convergence");
+  cfg.sim.time_offset = 0.0025;
+  const TrialResult r = calib::runTrial(cfg, 2);
+  REQUIRE(r.ok);
+  CHECK(r.converged);
+  CHECK(r.horizon_rotation_error_deg == r.final_rotation_error_deg);
+  CHECK(r.convergence_time > 0.0);
+  CHECK(r.convergence_time < cfg.convergence_horizon);
+
+  // A run that stops before the horizon cannot certify convergence within it.
+  cfg.sim.duration = 30.0;
+  const TrialResult s = calib::runTrial(cfg, 2);
+  REQUIRE(s.ok);
+  CHECK(s.final_rotation_error_deg < cfg.rotation_threshold_deg);
+  CHECK_FALSE(s.converged);
+  CHECK(s.convergence_time == -1.0);
+}
 
 TEST_CASE("the change detector catches a knock and the estimate recovers quickly",
           "[calib][change][slow]") {

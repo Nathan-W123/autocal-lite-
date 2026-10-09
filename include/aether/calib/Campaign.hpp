@@ -30,7 +30,11 @@ struct TrialConfig {
   double tracking_start = -1.0;
 
   double series_interval = 0.5;  ///< Sampling of the recorded time series [s] (<= 0: none)
-  double frame_lookahead = 0.1;  ///< Frames are queued this far ahead of the IMU [s]
+  /// Each stereo frame is handed to the calibrator this long after its exposure, as a camera
+  /// driver would deliver it [s]. The calibrator is run with `max_frame_latency` of at least
+  /// this plus 50 ms, so it lags the newest IMU sample and still fuses every frame at its
+  /// exposure time.
+  double frame_delivery_latency = 0.03;
 };
 
 /// \brief One row of a recorded time series (estimate vs. hidden truth).
@@ -71,10 +75,12 @@ struct TrialResult {
   double final_translation_error = 0.0;    ///< At the end of the run [m]
   double horizon_rotation_error_deg = 0.0; ///< At the convergence horizon [deg]
   double horizon_translation_error = 0.0;  ///< At the convergence horizon [m]
-  bool converged = false;           ///< Both errors below threshold at the horizon.
+  /// Both errors below threshold at the horizon (false if the run ended before it).
+  bool converged = false;
   /// Earliest time after which both errors stay below their thresholds up to the horizon
   /// (-1 when not converged).
   double convergence_time = -1.0;
+  int tracking_samples = 0;              ///< Frames scored in the tracking window.
   double tracking_max_error_deg = 0.0;   ///< Max rotation error over the tracking window [deg]
   double tracking_rms_error_deg = 0.0;   ///< RMS rotation error over the tracking window [deg]
   double tracking_max_translation = 0.0; ///< Max lever-arm error over the window [m]
@@ -89,6 +95,7 @@ struct TrialResult {
   double mean_nis_per_dof = 0.0;   ///< Mean vision NIS per dof (1 expected)
   double mean_landmarks_used = 0.0;
   int frames_fused = 0;
+  int frames_dropped = 0;          ///< Frames that arrived too late to be fused (0 expected).
   int change_events = 0;
   std::vector<double> change_times;  ///< When the change detector fired [s]
   bool static_init_ok = false;
@@ -107,7 +114,8 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index = 
 /// - `drift_frozen`: same, with the extrinsic random walk switched off (calibrate-once baseline).
 /// - `knock`: a 1.5 deg / 2 cm step at t = 90 s, with the change detector.
 /// - `knock_no_detector`: same without the detector.
-/// - `time_offset`: 8 ms camera-IMU offset, estimated online.
+/// - `time_offset`: 8 ms camera-IMU offset (estimated online, as in every scenario).
+/// - `time_offset_ignored`: 2.5 ms offset with time-offset estimation switched off.
 /// - `yaw_only`: roll and pitch excitation removed (observability ablation).
 /// - `outliers`: 5 % wrong correspondences.
 /// \throws std::invalid_argument on an unknown name.

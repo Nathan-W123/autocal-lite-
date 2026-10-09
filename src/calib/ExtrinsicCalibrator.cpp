@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "aether/calib/MeasurementModel.hpp"
 #include "aether/estimation/EskfCore.hpp"
@@ -43,20 +44,38 @@ void ExtrinsicCalibrator::addFrame(StereoFrame frame) {
 }
 
 void ExtrinsicCalibrator::addImu(const sensors::ImuSample& sample) {
+  if (!(sample.time > last_imu_time_)) return;  // IMU must move forward in time
+  last_imu_time_ = sample.time;
   if (!initialised_) {
     init_samples_.push_back(sample);
     if (sample.time - init_samples_.front().time >= cfg_.static_init_duration - 1e-9)
       initialiseFromStatic();
     return;
   }
-  if (!(sample.time > time_)) return;  // IMU must move forward in time
+  imu_buffer_.push_back(sample);
+  processImuUntil(sample.time - cfg_.max_frame_latency);
+}
 
+void ExtrinsicCalibrator::flush() {
+  processImuUntil(std::numeric_limits<double>::infinity());
+}
+
+void ExtrinsicCalibrator::processImuUntil(double t) {
+  while (!imu_buffer_.empty() && imu_buffer_.front().time <= t + 1e-12) {
+    const sensors::ImuSample sample = imu_buffer_.front();
+    imu_buffer_.pop_front();
+    stepImu(sample);
+  }
+}
+
+void ExtrinsicCalibrator::stepImu(const sensors::ImuSample& sample) {
   const double late_tolerance = 0.5 / cfg_.imu_rate;
   while (!frames_.empty()) {
     const double tau = frames_.front().stamp + td_;
     if (tau > sample.time) break;
     if (tau < time_ - late_tolerance) {  // exposure before the filter's present: unusable
       frames_.pop_front();
+      if (tau >= init_time_ - late_tolerance) ++dropped_frames_;  // pre-start frames don't count
       continue;
     }
     const sensors::ImuSample at_frame = interpolate(segment_start_, sample, std::max(tau, time_));
@@ -113,6 +132,10 @@ void ExtrinsicCalibrator::initialiseFromStatic() {
 
   segment_start_ = init_samples_.back();
   time_ = segment_start_.time;
+  init_time_ = time_;
+  // Frames exposed before the filter existed are discarded (they are not "late").
+  while (!frames_.empty() && frames_.front().stamp + td_ < time_ - 0.5 / cfg_.imu_rate)
+    frames_.pop_front();
   init_samples_.clear();
   init_samples_.shrink_to_fit();
   initialised_ = true;
@@ -203,7 +226,7 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
   report.observations = static_cast<int>(frame.observations.size());
 
   if (!has_clone_) {
-    cloneCurrentPose(gyro_at_frame - bg_);
+    cloneCurrentPose(gyro_at_frame - bg_, frame.stamp + td_ - time_);
     clone_observations_ = frame.observations;
     if (callback_) callback_(report);
     return;
@@ -367,11 +390,13 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
     }
   }
 
-  // The current pose becomes the anchor of the next frame.
+  // The current pose becomes the anchor of the next frame. It must represent the exposure
+  // time as now estimated, stamp + t_d_hat: if this update moved t_d_hat, the filter time
+  // (the exposure time as estimated *before* the update) is off by that correction.
   if (cfg_.disjoint_pairs) {
     has_clone_ = false;
   } else {
-    cloneCurrentPose(gyro_at_frame - bg_);
+    cloneCurrentPose(gyro_at_frame - bg_, frame.stamp + td_ - time_);
     clone_observations_ = frame.observations;
   }
   if (callback_) callback_(report);
@@ -393,9 +418,10 @@ void ExtrinsicCalibrator::injectAndReset(const VecX& dx) {
   estimation::applyAttitudeReset(P_, dx, {kIdxAttitude, kIdxExtRotation, kIdxCloneAttitude});
 }
 
-void ExtrinsicCalibrator::cloneCurrentPose(const Vec3& omega) {
-  clone_q_ = q_wi_;
-  clone_p_ = p_;
+void ExtrinsicCalibrator::cloneCurrentPose(const Vec3& omega, double shift) {
+  // Pose at time_ + shift to first order (the shift is a few ms at most).
+  clone_q_ = math::boxPlus(q_wi_, omega * shift);
+  clone_p_ = p_ + v_ * shift;
   clone_omega_ = omega;
   clone_v_ = v_;
   has_clone_ = true;

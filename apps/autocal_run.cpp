@@ -59,32 +59,39 @@ int main(int argc, char** argv) {
   int trial = 0;
   std::string output = "results/runs";
   std::vector<std::string> overrides;
-  for (int i = 1; i < argc; ++i) {
-    const std::string a = argv[i];
-    auto next = [&]() -> std::string {
-      if (i + 1 >= argc) {
+  try {
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      auto next = [&]() -> std::string {
+        if (i + 1 >= argc) {
+          usage();
+          std::exit(2);
+        }
+        return argv[++i];
+      };
+      if (a == "--scenario") {
+        name = next();
+      } else if (a == "--seed") {
+        master_seed = std::stoull(next());
+      } else if (a == "--trial") {
+        trial = std::stoi(next());
+      } else if (a == "--output") {
+        output = next();
+      } else if (a == "--set") {
+        overrides.push_back(next());
+      } else if (a == "--help" || a == "-h") {
         usage();
-        std::exit(2);
+        return 0;
+      } else {
+        usage();
+        return 2;
       }
-      return argv[++i];
-    };
-    if (a == "--scenario") {
-      name = next();
-    } else if (a == "--seed") {
-      master_seed = std::stoull(next());
-    } else if (a == "--trial") {
-      trial = std::stoi(next());
-    } else if (a == "--output") {
-      output = next();
-    } else if (a == "--set") {
-      overrides.push_back(next());
-    } else if (a == "--help" || a == "-h") {
-      usage();
-      return 0;
-    } else {
-      usage();
-      return 2;
     }
+    if (trial < 0) throw std::invalid_argument("--trial must be >= 0");
+  } catch (const std::exception& e) {
+    std::cerr << "autocal_run: bad argument (" << e.what() << ")\n";
+    usage();
+    return 2;
   }
 
   calib::TrialConfig cfg;
@@ -107,7 +114,7 @@ int main(int argc, char** argv) {
             << r.wall_clock_seconds << " s wall)\n"
             << "static init         " << (r.static_init_ok ? "passed" : "FAILED") << "\n"
             << "frames fused        " << r.frames_fused << "  (mean " << r.mean_landmarks_used
-            << " landmarks)\n"
+            << " landmarks, " << r.frames_dropped << " dropped)\n"
             << "error @ horizon     " << r.horizon_rotation_error_deg << " deg, "
             << 100.0 * r.horizon_translation_error << " cm  -> "
             << (r.converged ? "CONVERGED" : "not converged") << "\n"

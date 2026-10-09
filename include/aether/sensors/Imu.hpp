@@ -4,9 +4,10 @@
 /// Reused from Aether6 (`include/aether/sensors/Sensors.hpp`). `ImuConfig` and `ImuSample`
 /// are Aether6's structures unchanged, and `ImuModel` is the IMU branch of Aether6's
 /// `SensorSuite` lifted out of the multi-sensor suite: same noise model, same SplitMix64
-/// stream for the IMU, same sampling scheduler. The only change is the input: the aircraft
-/// truth state is replaced by a body rate and specific force supplied by the caller, so the
-/// model can sit behind any kinematic truth generator.
+/// stream and draw order for the IMU. Two things change. The aircraft truth state is replaced
+/// by a body rate and specific force supplied by the caller, so the model can sit behind any
+/// kinematic truth generator. And the caller decides when to sample: Aether6's per-sensor
+/// schedule is not needed because CalibSimulator samples at exact multiples of 1/rate.
 #pragma once
 
 #include <cstdint>
