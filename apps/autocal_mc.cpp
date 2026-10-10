@@ -90,6 +90,7 @@ struct ScenarioSummary {
   int ok = 0;
   int converged = 0;
   int tracked = 0;           ///< Trials whose max tracking error met the threshold.
+  int status_converged = 0;  ///< Trials whose status said "converged" at the horizon.
   bool has_tracking = false;
   double tracking_threshold_deg = 0.3;
   std::vector<mc::MetricStatistics> stats;
@@ -176,7 +177,7 @@ int main(int argc, char** argv) {
     sum.has_tracking = cfg.tracking_start >= 0.0;
     sum.tracking_threshold_deg = kTrackingThresholdDeg;
     std::vector<double> hr, ht, fr, ft, ct, tm, tr, tt, nees, nis, td, bg, ba, wall, lm, rec,
-        events, latency;
+        events, latency, pixel, false_conf, status_time;
     std::vector<calib::TrialResult> valid;
     for (std::size_t i = 0; i < run.results.size(); ++i) {
       const auto& t = run.results[i];
@@ -205,6 +206,12 @@ int main(int argc, char** argv) {
         }
       }
       events.push_back(static_cast<double>(t.change_events));
+      pixel.push_back(t.final_pixel_sigma);
+      false_conf.push_back(static_cast<double>(t.false_confidence_frames));
+      if (t.status_converged_at_horizon) {
+        ++sum.status_converged;
+        status_time.push_back(t.status_convergence_time);
+      }
       nees.push_back(t.mean_nees);
       nis.push_back(t.mean_nis_per_dof);
       td.push_back(1000.0 * t.final_time_offset_error);
@@ -225,6 +232,9 @@ int main(int argc, char** argv) {
                  mc::computeStatistics("recovery_time", "s", rec),
                  mc::computeStatistics("change_events", "-", events),
                  mc::computeStatistics("detection_latency", "s", latency),
+                 mc::computeStatistics("final_pixel_sigma", "px", pixel),
+                 mc::computeStatistics("false_confidence_frames", "-", false_conf),
+                 mc::computeStatistics("status_convergence_time", "s", status_time),
                  mc::computeStatistics("mean_nees", "-", nees),
                  mc::computeStatistics("mean_nis_per_dof", "-", nis),
                  mc::computeStatistics("final_time_offset_error", "ms", td),
@@ -246,7 +256,9 @@ int main(int argc, char** argv) {
                          "final_td_err_s", "final_gyro_bias_err", "final_accel_bias_err",
                          "mean_nees", "mean_nis_per_dof", "mean_landmarks_used",
                          "frames_fused", "frames_dropped", "change_events", "static_init_ok",
-                         "wall_clock_s"});
+                         "final_pixel_sigma", "status_converged", "status_convergence_time_s",
+                         "false_confidence_frames", "final_state", "weakest_trans_axis_x",
+                         "weakest_trans_axis_y", "weakest_trans_axis_z", "wall_clock_s"});
       for (std::size_t i = 0; i < run.results.size(); ++i) {
         const auto& t = run.results[i];
         const bool ok = run.errors[i].empty() && t.ok;
@@ -261,7 +273,12 @@ int main(int argc, char** argv) {
                     t.mean_landmarks_used, static_cast<double>(t.frames_fused),
                     static_cast<double>(t.frames_dropped),
                     static_cast<double>(t.change_events), t.static_init_ok ? 1.0 : 0.0,
-                    t.wall_clock_seconds});
+                    t.final_pixel_sigma, t.status_converged_at_horizon ? 1.0 : 0.0,
+                    t.status_convergence_time, static_cast<double>(t.false_confidence_frames),
+                    static_cast<double>(t.final_status.state),
+                    t.final_status.weakest_translation_axis.x(),
+                    t.final_status.weakest_translation_axis.y(),
+                    t.final_status.weakest_translation_axis.z(), t.wall_clock_seconds});
       }
     }
     writeEnvelope(dir + "/envelope.csv", valid, cfg.series_interval > 0 ? cfg.series_interval : 1.0);
@@ -281,6 +298,7 @@ int main(int argc, char** argv) {
         << "  \"convergence_horizon_s\": " << cfg.convergence_horizon << ",\n"
         << "  \"completed\": " << sum.ok << ",\n"
         << "  \"converged\": " << sum.converged << ",\n"
+        << "  \"status_converged\": " << sum.status_converged << ",\n"
         << "  \"convergence_rate\": "
         << (sum.trials > 0 ? static_cast<double>(sum.converged) / sum.trials : 0.0) << ",\n";
       if (sum.has_tracking) {

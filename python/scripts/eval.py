@@ -30,8 +30,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CORE = ["convergence", "drift", "drift_frozen"]
-EXTRA = ["time_offset", "time_offset_ignored", "yaw_only", "outliers", "knock",
-         "knock_no_detector"]
+EXTRA = ["time_offset", "time_offset_ignored", "noise_misspecified", "noise_misspecified_fixed",
+         "yaw_only", "outliers", "knock", "knock_no_detector"]
 
 
 def run_campaigns(binary: Path, scenarios: list[str], trials: int, output: Path, threads: int) -> None:
@@ -104,6 +104,14 @@ def report(output: Path) -> int:
         print(f"| mean vision NIS per dof (1 = consistent) | {s['mean_nis_per_dof']['mean']:.3f} |")
         print(f"| landmarks fused per frame, mean | {s['mean_landmarks_used']['mean']:.0f} |")
         print(f"| change-detector false alarms | {s['change_events']['mean'] * s['change_events']['count']:.0f} |")
+        print(f"| pixel noise estimated online, p50 [min, max] | "
+              f"{s['final_pixel_sigma']['median']:.3f} [{s['final_pixel_sigma']['min']:.3f}, "
+              f"{s['final_pixel_sigma']['max']:.3f}] px (true 0.5) |")
+        sc = s["status_convergence_time"]
+        print(f"| status certified convergence by 60 s | {conv.get('status_converged', 0)}/{conv['trials']}"
+              + (f", at {sc['median']:.1f} s (p50) / {sc['p95']:.1f} s (p95)" if sc['count'] else "")
+              + f"; frames certified with the truth outside the bounds: "
+              f"{s['false_confidence_frames']['mean'] * s['false_confidence_frames']['count']:.0f} |")
         print(f"| wall clock per 60 s run, mean | {s['trial_wall_clock']['mean']:.2f} s |")
 
     # ---------------------------------------------------------------- criterion 2
@@ -150,6 +158,12 @@ def report(output: Path) -> int:
                 extra = f"t_d error p50 / p95: {fmt(s['final_time_offset_error'], keys=('median', 'p95'), digits=2)} ms"
             elif name == "time_offset_ignored":
                 extra = "2.5 ms camera lag, t_d estimation switched off"
+            elif name == "noise_misspecified":
+                extra = (f"1.0 px pixel noise, filter configured for 0.5 px; noise estimated online "
+                         f"as {s['final_pixel_sigma']['median']:.3f} px (p50); NEES "
+                         f"{s['mean_nees']['mean']:.1f}")
+            elif name == "noise_misspecified_fixed":
+                extra = (f"same, noise estimation switched off; NEES {s['mean_nees']['mean']:.1f}")
             elif name.startswith("knock"):
                 rec = s["recovery_time"]
                 recovered = f"{rec['count']}/{r['trials']} back under 0.5 deg & 1 cm"
@@ -169,6 +183,35 @@ def report(output: Path) -> int:
             print(f"| {name} | {r['converged']}/{r['trials']} | "
                   f"{fmt(s['horizon_rotation_error'], keys=('median', 'p95'))} | "
                   f"{fmt(s['horizon_translation_error'], keys=('median', 'p95'), digits=2)} | {extra} |")
+
+    # ---------------------------------------------------------------- self-assessment
+    status_rows = [(n, load_summary(output, n)) for n in CORE + EXTRA]
+    status_rows = [(n, r) for n, r in status_rows
+                   if r is not None and "false_confidence_frames" in r["stats"]]
+    if status_rows:
+        print("\n## 4. Self-assessment: does the status know when it is calibrated?\n")
+        print("`status()` says *converged* when its bound along the least-certain direction is "
+              "inside 0.5 deg / 1 cm. A false claim is a frame where it says so while the true "
+              "error is outside.\n")
+        print("| scenario | status says converged at 60 s | certified at p50 / p95 [s] "
+              "| truth inside at p50 / p95 [s] | frames with a false claim |")
+        print("|---|---|---|---|---|")
+        for name, r in status_rows:
+            s = r["stats"]
+            sc, tc = s["status_convergence_time"], s["convergence_time"]
+            false_claims = s["false_confidence_frames"]["mean"] * s["false_confidence_frames"]["count"]
+            notes = {
+                "knock": " (between a knock and its detection)",
+                "knock_no_detector": " (detector off: nothing tells the filter the mount moved)",
+                "drift_frozen": " (no random walk: the filter cannot follow the drift)",
+                "noise_misspecified_fixed": " (noise estimation off: over-confident)",
+                "time_offset_ignored": " (timing model wrong)",
+            }
+            note = notes.get(name, "") if false_claims else ""
+            print(f"| {name} | {r.get('status_converged', 0)}/{r['trials']} | "
+                  + (f"{sc['median']:.1f} / {sc['p95']:.1f}" if sc["count"] else "-") + " | "
+                  + (f"{tc['median']:.1f} / {tc['p95']:.1f}" if tc["count"] else "-")
+                  + f" | {false_claims:.0f}{note} |")
 
     # ---------------------------------------------------------------- plot data
     env_path = output / "drift" / "envelope.csv"
@@ -196,7 +239,7 @@ def report(output: Path) -> int:
             w = csv.DictWriter(f, fieldnames=list(rows_out[0].keys()))
             w.writeheader()
             w.writerows(rows_out)
-        print(f"\n## 4. Drift-tracking plot data ({path.relative_to(ROOT) if path.is_relative_to(ROOT) else path})\n")
+        print(f"\n## 5. Drift-tracking plot data ({path.relative_to(ROOT) if path.is_relative_to(ROOT) else path})\n")
         print("| t [s] | truth drift [deg] | estimate [deg] | online err p50 / p95 / max [deg] "
               "| frozen err p50 [deg] |")
         print("|---|---|---|---|---|")

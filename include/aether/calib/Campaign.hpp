@@ -62,6 +62,10 @@ struct SeriesSample {
   Vec3 attitude_error = Vec3::Zero();   ///< Log(R_est^T R_true), body frame [rad]
   double velocity_nees = 0.0;           ///< 3-dof NEES of the velocity
   double attitude_nees = 0.0;           ///< 3-dof NEES of the attitude
+  double pixel_sigma = 0.0;             ///< Pixel noise the filter assumes (adapted) [px]
+  CalibrationState state = CalibrationState::kInitialising;  ///< status().state
+  double rotation_bound_deg = 0.0;      ///< status().rotation_bound [deg]
+  double translation_bound = 0.0;       ///< status().translation_bound [m]
 };
 
 /// \brief Outcome and scores of one trial.
@@ -98,6 +102,17 @@ struct TrialResult {
   int frames_dropped = 0;          ///< Frames that arrived too late to be fused (0 expected).
   int change_events = 0;
   std::vector<double> change_times;  ///< When the change detector fired [s]
+
+  // Self-assessment (ExtrinsicCalibrator::status()) scored against the hidden truth.
+  CalibrationStatus final_status;    ///< Status at the end of the run.
+  bool status_converged_at_horizon = false;  ///< Status said "converged" at the horizon.
+  /// Earliest time after which the status says "converged" up to the horizon (-1 if never).
+  double status_convergence_time = -1.0;
+  int status_converged_frames = 0;   ///< Frames on which the status said "converged".
+  /// Frames on which the status said "converged" while the true error was outside the
+  /// converged bounds (rotation or lever arm). This is the number that must stay at 0.
+  int false_confidence_frames = 0;
+  double final_pixel_sigma = 0.0;    ///< Pixel noise the filter ended up assuming [px]
   bool static_init_ok = false;
   double wall_clock_seconds = 0.0;
   std::vector<SeriesSample> series;
@@ -116,6 +131,8 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index = 
 /// - `knock_no_detector`: same without the detector.
 /// - `time_offset`: 8 ms camera-IMU offset (estimated online, as in every scenario).
 /// - `time_offset_ignored`: 2.5 ms offset with time-offset estimation switched off.
+/// - `noise_misspecified`: 1.0 px pixel noise while the filter is configured for 0.5 px
+///   (the online noise estimate corrects it); `noise_misspecified_fixed`: same, adaptation off.
 /// - `yaw_only`: roll and pitch excitation removed (observability ablation).
 /// - `outliers`: 5 % wrong correspondences.
 /// \throws std::invalid_argument on an unknown name.
@@ -130,7 +147,7 @@ std::vector<std::string> scenarioNames();
 /// `duration`, `prior_rot_deg`, `prior_trans_m`, `pixel_noise` (truth), `pixel_sigma`
 /// (assumed), `rot_walk`, `trans_walk`, `landmarks`, `camera_rate`, `time_offset` (truth),
 /// `estimate_time_offset` (0/1), `outlier_fraction`, `landmark_gate`, `detect_change` (0/1),
-/// `drift_rate_deg_per_min`, `drift_start`, `tracking_start`, `roll_pitch_scale`,
+/// `adapt_pixel_noise` (0/1), `drift_rate_deg_per_min`, `drift_start`, `tracking_start`, `roll_pitch_scale`,
 /// `yaw_scale`, `gyro_noise_scale`, `accel_noise_scale`, `series_interval`.
 /// \throws std::invalid_argument on an unknown key or malformed value.
 void applyOverride(TrialConfig* config, const std::string& assignment);

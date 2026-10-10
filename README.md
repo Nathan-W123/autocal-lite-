@@ -31,6 +31,8 @@ Supplementary scenarios (same 50 seeds):
 |---|---|---|
 | `time_offset` | camera clock 8 ms off the IMU clock (t_d is estimated in every scenario) | 50 / 50 converge; t_d recovered to 0.02 ms (p50), 0.06 ms (p95) |
 | `time_offset_ignored` | camera lags 2.5 ms but the filter assumes perfect sync | **4 / 50 converge**: the lever arm absorbs the lag (1.5 cm p50 error). The change detector flags the misfit, firing ~6× per run. This is why t_d is always estimated |
+| `noise_misspecified` | pixels are twice as noisy as configured (1.0 px vs 0.5 px) | 50 / 50 converge (p95 0.032° / 0.49 cm): the filter measures the real noise online (0.998 px, p50) and stays consistent (NEES 1.5) |
+| `noise_misspecified_fixed` | same, noise estimation switched off | **39 / 50 converge** (p95 0.084° / 1.44 cm), NEES 24: confidently wrong |
 | `outliers` | 5 % of the correspondences are wrong | 50 / 50 converge (p95 0.025° / 0.32 cm); the per-landmark χ² gate removes them |
 | `knock` | the mount is knocked by 1.5° / 1.95 cm at t = 90 s | the change detector fires exactly once in every run, 0.30 s after the knock (p50; 0.40 s worst). Back under 0.5° and 1 cm after 3.5 s (p50) / 8.8 s (p95), 0.013° / 0.15 cm at 180 s. The rotation error never exceeds the knock; the lever arm overshoots to 3.0 cm (p50) for a few seconds |
 | `knock_no_detector` | same knock, detector off | the random walk recovers the rotation but not the lever arm: still 1.05 cm off at 180 s (6 / 50 back under 1 cm) |
@@ -39,10 +41,36 @@ Supplementary scenarios (same 50 seeds):
 
 Every frame is delivered to the estimator 30 ms after its exposure; no frame was dropped in
 any run. The extrinsic covariance is reported alongside every estimate. The vision NIS is
-1.00 per degree of freedom, so the noise model matches the data. The extrinsic NEES is 2.0
-(6 = consistent): the filter is **conservative** by about √(6/2.0) ≈ 1.7× in σ, for a known
-reason ([docs/method.md §8](docs/method.md#8-consistency-honestly)). A 60 s run takes 0.97 s
-of wall-clock time on one core.
+1.00 per degree of freedom, so the noise model matches the data; the pixel noise is
+estimated online, so it keeps matching when the configured value is wrong. The extrinsic NEES
+is 2.0 (6 = consistent): the filter is **conservative** by about √(6/2.0) ≈ 1.7× in σ, for a
+known reason ([docs/method.md §8](docs/method.md#8-consistency-honestly)). A 60 s run takes
+about 1.2 s of wall-clock time on one core.
+
+### Does it know when it is done?
+
+`ExtrinsicCalibrator::status()` turns the covariance into a verdict an operator or a
+supervising process can act on. It reports a state (initialising / calibrating / converged /
+recalibrating), 2σ bounds along the *least-certain* rotation and lever-arm directions, which
+directions those are, the recent rotation excitation about each IMU axis, and one line of
+advice. *Converged* means both bounds are inside the 0.5° / 1 cm acceptance criteria.
+
+| scenario | status says converged at 60 s | certified at (p50) | truth inside at (p50) | frames where it claimed convergence wrongly |
+|---|---|---|---|---|
+| `convergence`, `drift`, `time_offset`, `outliers` | 200 / 200 | 16–17 s | 6 s | **0** |
+| `noise_misspecified` (noise estimated) | 50 / 50 | 44.5 s | 8.8 s | **0** |
+| `yaw_only` | 0 / 50 (correct: the lever arm is not observable) | – | – | **0** |
+| `knock` | 50 / 50 | 16 s | 6 s | 469 — all in the 0.3 s between a knock and its detection |
+| `noise_misspecified_fixed` (noise estimation off) | 50 / 50 | 22.8 s | 26.4 s | 12 860 — why the noise must be estimated |
+
+It is cautious by design: it certifies about 10 s after the truth gets there, and never
+before. The advice tracks what the motion can and cannot observe:
+
+```
+converged:   calibrated: rotation +-0.042 deg, lever arm +-4.9 mm (2-sigma)
+gentle:      converging slowly: lever arm along IMU y (right) +-22.8 mm; more yaw (about z) or roll (about x) would speed it up
+yaw only:    needs motion: lever arm along IMU z (down) is not observable from the current motion; roll (about x) or pitch (about y) the rig
+```
 
 ## The problem
 
@@ -93,6 +121,12 @@ normal operation**:
 * **Observability.** The figure-eight trajectory carries roll, pitch *and* yaw excitation.
   With rotation about a single axis, the lever-arm component along that axis is
   unobservable (the `yaw_only` row above shows this).
+* **Self-tuning noise.** After the QR compression, the part of the residual that no state can
+  explain is pure pixel noise with a known number of degrees of freedom. Its running mean
+  rescales the pixel noise model, independently of the filter's own covariance.
+* **Self-assessment.** `status()` reads the covariance: 2σ bounds and weakest directions,
+  excitation per axis, and advice on which rotation would make the weakest direction
+  observable.
 
 The full derivation (Jacobians, null-space marginalisation, observability, the drift/knock
 logic, and a candid consistency analysis) is in [docs/method.md](docs/method.md).
@@ -152,7 +186,8 @@ command line, for example:
 ```
 
 Scenarios: `convergence`, `drift`, `drift_frozen`, `knock`, `knock_no_detector`,
-`time_offset`, `time_offset_ignored`, `yaw_only`, `outliers`. `autocal_run --trial I`
+`time_offset`, `time_offset_ignored`, `noise_misspecified`, `noise_misspecified_fixed`,
+`yaw_only`, `outliers`. `autocal_run --trial I`
 reproduces trial `I` of a campaign exactly.
 
 ## Layout
@@ -181,8 +216,12 @@ same filter holds a mount that drifts 1° in 10 minutes to within 0.06°, where 
 treats the mount as fixed ends 0.55° off and keeps diverging. When the hardware is knocked, a
 χ² test on the filter's own corrections notices within 0.4 s, and the calibration
 re-converges in seconds with no operator. That is the "never recalibrate again"
-behaviour, in miniature. What makes it trustworthy rather than a demo is what AutoCal needs
-at scale: analytic Jacobians checked against numerical ones, a noise-free regression test
+behaviour, in miniature. It also knows when it is done: it measures its own pixel noise,
+certifies convergence only when its bounds are inside tolerance (never once wrongly in 300
+runs without a knock or a deliberately broken model, including 50 with misconfigured noise
+that it corrected itself), and when the motion cannot observe part of the extrinsic it says
+which part and which rotation would fix it. What makes it trustworthy rather than a demo is
+what AutoCal needs at scale: analytic Jacobians checked against numerical ones, a noise-free regression test
 that catches simulator/estimator timing mismatches, consistency statistics reported next to
 accuracy, zero false change alarms across 200 armed runs, and an observability ablation that
 shows which motions the calibration needs. Growing it toward AutoCal means adding states and
@@ -191,12 +230,13 @@ sensors (intrinsics, more cameras, LiDAR), not changing the approach.
 ## Scope and limitations
 
 This is a prototype on simulated data, not a product. The camera is an ideal rectified
-pinhole pair: no lens distortion, no rolling shutter, known intrinsics. The estimator is
-given the simulator's true noise parameters (IMU noise densities and random walks, pixel σ);
-with real sensors they would come from an Allan-variance characterisation and would be
-inflated somewhat. Correspondences are given rather than detected. Only stereo + IMU is
+pinhole pair: no lens distortion, no rolling shutter, known intrinsics. The pixel noise is
+estimated online, but the IMU noise parameters (white-noise densities and bias random walks)
+are the simulator's true values; with real sensors they would come from an Allan-variance
+characterisation and would be inflated somewhat. Correspondences are given rather than detected. Only stereo + IMU is
 calibrated. The motion is a deliberately exciting figure-eight. The filter's covariance is
 conservative by roughly 1.7× in σ ([docs/method.md §8](docs/method.md#8-consistency-honestly)
-explains why and what it would cost to remove). The natural next steps toward AutoCal are camera intrinsics in the state,
-real data with a feature front end, more sensor pairs (LiDAR-camera, multi-camera), and an
-excitation monitor that tells the operator when the motion is not informative enough.
+explains why and what it would cost to remove). The natural next steps toward AutoCal are
+longer feature tracks (a short sliding window, for more information per update under gentle
+motion and a consistent covariance), camera intrinsics in the state, real data with a
+feature front end, and more sensor pairs (LiDAR-camera, multi-camera).

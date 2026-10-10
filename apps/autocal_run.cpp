@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "aether/calib/Campaign.hpp"
+#include "aether/core/Constants.hpp"
 #include "aether/mc/MonteCarlo.hpp"
 #include "aether/util/Csv.hpp"
 
@@ -35,7 +36,8 @@ void writeSeries(const std::string& path, const calib::TrialResult& r) {
                            "trans_sigma_z_m", "nees", "truth_drift_deg", "estimate_drift_deg",
                            "td_truth_s", "td_estimate_s", "gyro_bias_err", "accel_bias_err",
                            "nis_per_dof", "landmarks_used", "vel_err_x", "vel_err_y", "vel_err_z",
-                           "att_err_x", "att_err_y", "att_err_z", "vel_nees", "att_nees"});
+                           "att_err_x", "att_err_y", "att_err_z", "vel_nees", "att_nees",
+                           "pixel_sigma", "state", "rot_bound_deg", "trans_bound_m"});
   for (const auto& s : r.series) {
     w.writeRow({s.time, s.rotation_error_deg, s.translation_error, s.rotation_error.x(),
                 s.rotation_error.y(), s.rotation_error.z(), s.translation_error_vec.x(),
@@ -47,7 +49,8 @@ void writeSeries(const std::string& path, const calib::TrialResult& r) {
                 static_cast<double>(s.landmarks_used), s.velocity_error.x(),
                 s.velocity_error.y(), s.velocity_error.z(), s.attitude_error.x(),
                 s.attitude_error.y(), s.attitude_error.z(), s.velocity_nees,
-                s.attitude_nees});
+                s.attitude_nees, s.pixel_sigma, static_cast<double>(s.state), s.rotation_bound_deg,
+                s.translation_bound});
   }
 }
 
@@ -133,7 +136,19 @@ int main(int argc, char** argv) {
             << r.mean_nis_per_dof << " (1 expected)\n"
             << "change events       " << r.change_events;
   for (double t : r.change_times) std::cout << (t == r.change_times.front() ? "  at " : ", ") << t << " s";
+  const calib::CalibrationStatus& st = r.final_status;
   std::cout << "\n"
+            << "pixel noise         " << r.final_pixel_sigma << " px assumed at the end (configured "
+            << cfg.calib.pixel_sigma << ", true " << cfg.sim.pixel_noise << ")\n"
+            << "status              " << calib::toString(st.state) << ": " << st.guidance << "\n"
+            << "  self-assessed     rotation +-" << st.rotation_bound * constants::kRadToDeg
+            << " deg, lever arm +-" << 1000.0 * st.translation_bound
+            << " mm (" << cfg.calib.status_sigma_multiplier
+            << "-sigma, least-certain directions)\n"
+            << "  converged at " << cfg.convergence_horizon << " s  "
+            << (r.status_converged_at_horizon ? "yes" : "no") << ", since " << r.status_convergence_time
+            << " s; frames claiming convergence with the truth outside the bounds: "
+            << r.false_confidence_frames << "\n"
             << "series              " << path << "\n";
   return r.ok ? 0 : 1;
 }

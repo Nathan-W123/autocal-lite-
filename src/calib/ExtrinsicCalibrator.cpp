@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <string>
 
 #include "aether/calib/MeasurementModel.hpp"
 #include "aether/estimation/EskfCore.hpp"
@@ -161,6 +163,10 @@ void ExtrinsicCalibrator::propagate(sensors::ImuSample a, const sensors::ImuSamp
   v_ += accel_w * dt;
   q_wi_ = q1;
 
+  // Running second moment of the body rate, for the excitation part of status().
+  const double alpha = std::min(1.0, dt / std::max(cfg_.excitation_window, 1e-6));
+  rate_moment_ += alpha * (w_mean * w_mean.transpose() - rate_moment_);
+
   // --- Error dynamics of the navigation block (Aether6 ErrorStateEkf::predict) ----------
   const Mat3 R_mid = math::quatToRotation(math::boxPlus(q1, -0.5 * w_mean * dt));
   MatX F = MatX::Zero(kNn, kNn);
@@ -236,7 +242,8 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
   const Mat3 R_ic = math::quatToRotation(q_ic_);
   ViewPose anchor{math::quatToRotation(clone_q_), clone_p_, clone_omega_, clone_v_};
   ViewPose current{math::quatToRotation(q_wi_), p_, gyro_at_frame - bg_, v_};
-  const double var_px = cfg_.pixel_sigma * cfg_.pixel_sigma;
+  const double var_cfg = cfg_.pixel_sigma * cfg_.pixel_sigma;
+  const double var_px = var_cfg * noise_scale_;
 
   // Landmarks in both frames (both observation lists are sorted by id).
   std::vector<std::pair<std::size_t, std::size_t>> matches;
@@ -345,8 +352,21 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
       H = qr.matrixQR().topRows(kNx).triangularView<Eigen::Upper>();
       residual_outside = qtr.tail(rows - kNx).squaredNorm();
       r = qtr.head(kNx);
+
+      // The rows - 28 residual components outside the range of H are orthogonal to every
+      // state direction, so they hold pixel noise only: E[|r_out|^2] = (rows - 28) sigma^2.
+      // That measures the true noise without depending on P, and a running mean of it
+      // rescales the configured noise.
+      if (cfg_.adapt_pixel_noise) {
+        const double scale_frame =
+            residual_outside / (static_cast<double>(rows - kNx) * var_cfg);
+        const double gain = 1.0 / std::max(cfg_.noise_adaptation_frames, 1);
+        noise_scale_ = std::clamp(noise_scale_ + gain * (scale_frame - noise_scale_),
+                                  cfg_.min_noise_scale, cfg_.max_noise_scale);
+      }
     }
-    const MatX R = MatX::Identity(H.rows(), H.rows()) * var_px;
+    const double var_update = var_cfg * noise_scale_;
+    const MatX R = MatX::Identity(H.rows(), H.rows()) * var_update;
     const Eigen::Matrix<double, 6, 6> P_ext_prior = P_.block<6, 6>(kIdxExtRotation, kIdxExtRotation);
     const estimation::UpdateResult upd = estimation::josephUpdate(P_, r, H, R, 0.0);
     if (upd.accepted) {
@@ -355,7 +375,7 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
       injectAndReset(upd.dx);
       report.updated = true;
       const double dof = static_cast<double>(rows);
-      const double nis = upd.nis + residual_outside / var_px;
+      const double nis = upd.nis + residual_outside / var_update;
       report.nis_per_dof = nis / dof;
 
       const VecX ext_var = P_.diagonal().segment<6>(kIdxExtRotation);
@@ -387,8 +407,11 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
           }
         }
       }
+      if (recalibrating_ && status().state == CalibrationState::kConverged)
+        recalibrating_ = false;
     }
   }
+  report.noise_scale = noise_scale_;
 
   // The current pose becomes the anchor of the next frame. It must represent the exposure
   // time as now estimated, stamp + t_d_hat: if this update moved t_d_hat, the filter time
@@ -447,6 +470,121 @@ void ExtrinsicCalibrator::reopenExtrinsic() {
   P_.block<3, 3>(kIdxExtRotation, kIdxExtRotation) = Mat3::Identity() * sr * sr;
   P_.block<3, 3>(kIdxExtTranslation, kIdxExtTranslation) = Mat3::Identity() * st * st;
   ++change_events_;
+  recalibrating_ = true;
+}
+
+const char* toString(CalibrationState state) {
+  switch (state) {
+    case CalibrationState::kInitialising: return "initialising";
+    case CalibrationState::kCalibrating: return "calibrating";
+    case CalibrationState::kConverged: return "converged";
+    case CalibrationState::kRecalibrating: return "recalibrating";
+  }
+  return "unknown";
+}
+
+namespace {
+
+/// Index of the IMU axis an (IMU-frame) direction is closest to.
+int dominantAxis(const Vec3& a) {
+  int k = 0;
+  a.cwiseAbs().maxCoeff(&k);
+  return k;
+}
+
+const char* axisName(int k) {
+  static const char* kNames[] = {"x (forward)", "y (right)", "z (down)"};
+  return kNames[k];
+}
+
+/// The rotations that observe a direction along IMU axis k: those about the other two axes.
+std::string perpendicularRotations(int k) {
+  static const char* kRotations[] = {"roll (about x)", "pitch (about y)", "yaw (about z)"};
+  return std::string(kRotations[(k + 1) % 3]) + " or " + kRotations[(k + 2) % 3];
+}
+
+}  // namespace
+
+CalibrationStatus ExtrinsicCalibrator::status() const {
+  CalibrationStatus s;
+  s.time = time_;
+  s.pixel_sigma = pixelSigma();
+  s.excitation = rate_moment_.diagonal().cwiseMax(0.0).cwiseSqrt();
+  if (!initialised_) {
+    s.state = CalibrationState::kInitialising;
+    s.guidance = "hold the rig still for the start-up window";
+    return s;
+  }
+
+  // Least-certain directions: the eigenvector of the largest eigenvalue of each block. The
+  // rotation error is a camera-frame rotation vector; report its axis in the IMU frame.
+  const Eigen::SelfAdjointEigenSolver<Mat3> rot(
+      P_.block<3, 3>(kIdxExtRotation, kIdxExtRotation));
+  const Eigen::SelfAdjointEigenSolver<Mat3> trans(
+      P_.block<3, 3>(kIdxExtTranslation, kIdxExtTranslation));
+  s.rotation_bound = cfg_.status_sigma_multiplier * std::sqrt(std::max(rot.eigenvalues()(2), 0.0));
+  s.translation_bound = cfg_.status_sigma_multiplier * std::sqrt(std::max(trans.eigenvalues()(2), 0.0));
+  s.weakest_rotation_axis = (math::quatToRotation(q_ic_) * rot.eigenvectors().col(2)).normalized();
+  s.weakest_translation_axis = trans.eigenvectors().col(2).normalized();
+  if (cfg_.estimate_time_offset)
+    s.time_offset_bound = cfg_.status_sigma_multiplier * std::sqrt(std::max(P_(kIdxTimeOffset, kIdxTimeOffset), 0.0));
+
+  s.rotation_converged = s.rotation_bound <= cfg_.converged_rotation_bound;
+  s.translation_converged = s.translation_bound <= cfg_.converged_translation_bound;
+  s.time_offset_converged =
+      !cfg_.estimate_time_offset || s.time_offset_bound <= cfg_.converged_time_offset_bound;
+
+  char buf[256];
+  if (s.rotation_converged && s.translation_converged && s.time_offset_converged) {
+    s.state = CalibrationState::kConverged;
+    std::snprintf(buf, sizeof(buf), "calibrated: rotation +-%.3f deg, lever arm +-%.1f mm (%g-sigma)",
+                  s.rotation_bound * constants::kRadToDeg, 1000.0 * s.translation_bound,
+                  cfg_.status_sigma_multiplier);
+    s.guidance = buf;
+    return s;
+  }
+  s.state = recalibrating_ ? CalibrationState::kRecalibrating : CalibrationState::kCalibrating;
+  const std::string prefix = recalibrating_ ? "mount change detected, re-converging: " : "";
+
+  // Which quantity is furthest from its tolerance?
+  const double rot_ratio = s.rotation_bound / cfg_.converged_rotation_bound;
+  const double trans_ratio = s.translation_bound / cfg_.converged_translation_bound;
+  const double td_ratio = cfg_.estimate_time_offset
+                              ? s.time_offset_bound / cfg_.converged_time_offset_bound
+                              : 0.0;
+  if (td_ratio > rot_ratio && td_ratio > trans_ratio) {
+    std::snprintf(buf, sizeof(buf), "converging: time offset +-%.2f ms, keep moving",
+                  1000.0 * s.time_offset_bound);
+    s.guidance = prefix + buf;
+    return s;
+  }
+  const bool translation_limits = trans_ratio >= rot_ratio;
+  const Vec3 axis = translation_limits ? s.weakest_translation_axis : s.weakest_rotation_axis;
+  const int k = dominantAxis(axis);
+  const std::string what = translation_limits ? "lever arm along" : "rotation about";
+  // A direction along `axis` is only observed by rotation about the perpendicular axes
+  // (rotation about `axis` itself leaves it unchanged), so judge the excitation there.
+  const double perpendicular_rate =
+      std::sqrt(std::max(rate_moment_.trace() - axis.dot(rate_moment_ * axis), 0.0));
+  if (perpendicular_rate < cfg_.min_excitation_rate) {
+    std::snprintf(buf, sizeof(buf), "needs motion: %s IMU %s is not observable from the "
+                  "current motion; %s the rig", what.c_str(), axisName(k),
+                  perpendicularRotations(k).c_str());
+  } else if (perpendicular_rate < cfg_.good_excitation_rate) {
+    std::snprintf(buf, sizeof(buf), "converging slowly: %s IMU %s +-%.*f %s; more %s would "
+                  "speed it up", what.c_str(), axisName(k), translation_limits ? 1 : 3,
+                  translation_limits ? 1000.0 * s.translation_bound
+                                     : s.rotation_bound * constants::kRadToDeg,
+                  translation_limits ? "mm" : "deg", perpendicularRotations(k).c_str());
+  } else if (translation_limits) {
+    std::snprintf(buf, sizeof(buf), "converging: lever arm along IMU %s +-%.1f mm, keep moving",
+                  axisName(k), 1000.0 * s.translation_bound);
+  } else {
+    std::snprintf(buf, sizeof(buf), "converging: rotation about IMU %s +-%.3f deg, keep moving",
+                  axisName(k), s.rotation_bound * constants::kRadToDeg);
+  }
+  s.guidance = prefix + buf;
+  return s;
 }
 
 }  // namespace aether::calib

@@ -2,8 +2,10 @@
 /// \brief Online, targetless stereo/IMU extrinsic calibration with an error-state EKF.
 #pragma once
 
+#include <cmath>
 #include <deque>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "aether/calib/Extrinsic.hpp"
@@ -35,7 +37,17 @@ struct CalibratorConfig {
   double time_offset_walk = 0.0;               ///< Time-offset random walk [s/sqrt(s)]
 
   // --- Vision measurement ---------------------------------------------------------
-  double pixel_sigma = 0.5;      ///< Pixel noise, 1-sigma per coordinate [px]
+  /// Pixel noise, 1-sigma per coordinate [px]. With `adapt_pixel_noise` this is only the
+  /// starting value: the filter rescales it to the noise it actually measures.
+  double pixel_sigma = 0.5;
+  /// Estimate the pixel noise online. After the QR compression, the part of the stacked
+  /// residual that no state can explain is pure measurement noise with a known number of
+  /// degrees of freedom, so it measures the true noise level independently of the state
+  /// covariance. Its running average rescales `pixel_sigma`.
+  bool adapt_pixel_noise = true;
+  int noise_adaptation_frames = 20;   ///< Averaging window of the noise estimate [frames]
+  double min_noise_scale = 0.1;       ///< Bounds on (adapted / configured variance) [-]
+  double max_noise_scale = 100.0;
   /// Per-landmark chi-squared gate on the 5-dof null-space residual (99.9 % = 20.5).
   double landmark_gate = 20.5;
   int min_landmarks = 8;         ///< Skip the update when fewer landmarks survive.
@@ -103,6 +115,60 @@ struct CalibratorConfig {
   /// Experimental: fuse disjoint frame pairs (0-1, 2-3, ...) so every observation is used
   /// exactly once, instead of every consecutive pair.
   bool disjoint_pairs = false;
+
+  // --- Calibration status (see ExtrinsicCalibrator::status()) ---------------------
+  /// The status bounds are this many filter sigmas along the least-certain direction [-].
+  /// 2 is enough because the filter covariance is conservative (NEES ~2 against 6, so a
+  /// filter sigma is ~1.7 true sigmas): in the evaluation the status never claimed
+  /// convergence with the true error outside the bounds, except between a knock and its
+  /// detection.
+  double status_sigma_multiplier = 2.0;
+  /// The calibration counts as converged once the bound along the least-certain direction
+  /// is below these. The defaults are the acceptance criteria of the evaluation.
+  double converged_rotation_bound = 0.5 * constants::kDegToRad;  ///< [rad]
+  double converged_translation_bound = 0.01;                      ///< [m]
+  double converged_time_offset_bound = 0.001;                     ///< [s]
+  /// Time constant of the running mean of the body rate used to judge excitation [s].
+  double excitation_window = 5.0;
+  /// RMS body rate about the axes that would observe the weakest direction below which the
+  /// status asks for more motion rather than more time [rad/s].
+  double min_excitation_rate = 0.1;
+  /// Below this RMS rate (but above the minimum) the status says convergence is slow and
+  /// names the rotations that would speed it up [rad/s].
+  double good_excitation_rate = 0.3;
+};
+
+/// \brief What the calibration is doing, for an operator or a supervising process.
+enum class CalibrationState {
+  kInitialising,   ///< Collecting the static start-up window.
+  kCalibrating,    ///< Running, not yet within the converged bounds.
+  kConverged,      ///< Every extrinsic (and time-offset) bound is within tolerance.
+  kRecalibrating,  ///< A mount change was detected; re-converging to the new mount.
+};
+
+/// Lower-case name of a state ("initialising", "calibrating", ...).
+const char* toString(CalibrationState state);
+
+/// \brief Self-assessment of the calibration, derived from the filter covariance.
+///
+/// The bounds are `status_sigma_multiplier` filter sigmas (default 2) along the least-certain
+/// direction, so a direction the motion has not excited stays visible even when the other
+/// two are well determined. The weakest directions are unit vectors in the IMU frame.
+struct CalibrationStatus {
+  CalibrationState state = CalibrationState::kInitialising;
+  double time = 0.0;                    ///< Filter time [s]
+  double rotation_bound = 0.0;          ///< k-sigma, least-certain rotation direction [rad]
+  double translation_bound = 0.0;       ///< k-sigma, least-certain lever-arm direction [m]
+  double time_offset_bound = 0.0;       ///< k-sigma of t_d (0 when not estimated) [s]
+  Vec3 weakest_rotation_axis = Vec3::UnitX();     ///< IMU frame, unit
+  Vec3 weakest_translation_axis = Vec3::UnitX();  ///< IMU frame, unit
+  bool rotation_converged = false;
+  bool translation_converged = false;
+  bool time_offset_converged = false;
+  /// RMS body rate about IMU x, y and z over the last `excitation_window` [rad/s].
+  Vec3 excitation = Vec3::Zero();
+  double pixel_sigma = 0.0;             ///< Pixel noise in use (adapted) [px]
+  std::string guidance;                 ///< One-line advice for the operator.
 };
 
 /// \brief Per-frame filter diagnostics, reported after every processed stereo frame.
@@ -114,6 +180,7 @@ struct FrameReport {
   int gated = 0;            ///< Landmarks rejected by the gate.
   bool updated = false;     ///< True when an EKF update was applied.
   double nis_per_dof = 0.0; ///< Normalised innovation squared per degree of freedom.
+  double noise_scale = 1.0; ///< Adapted / configured pixel-noise variance after this frame.
   double change_statistic = 0.0; ///< Change-detector statistic T (chi^2_6 under no change).
   bool change_detected = false;  ///< Change detector fired on this frame.
 };
@@ -212,6 +279,10 @@ class ExtrinsicCalibrator {
   }
   /// Number of times the change detector re-opened the extrinsic covariance.
   int changeEvents() const { return change_events_; }
+  /// Pixel noise currently assumed by the filter (adapted when `adapt_pixel_noise`) [px].
+  double pixelSigma() const { return cfg_.pixel_sigma * std::sqrt(noise_scale_); }
+  /// Self-assessment: state, k-sigma bounds, weakest directions and operator guidance.
+  CalibrationStatus status() const;
   /// Configuration in use.
   const CalibratorConfig& config() const { return cfg_; }
 
@@ -264,6 +335,13 @@ class ExtrinsicCalibrator {
   /// Per-update extrinsic correction and covariance reduction, for the change detector.
   std::deque<std::pair<Eigen::Matrix<double, 6, 1>, Eigen::Matrix<double, 6, 6>>> change_window_;
   int change_events_ = 0;
+  bool recalibrating_ = false;  ///< Set by a detected change, cleared on re-convergence.
+
+  // Pixel-noise adaptation: adapted / configured variance.
+  double noise_scale_ = 1.0;
+
+  // Running second moment of the bias-corrected body rate (excitation).
+  Mat3 rate_moment_ = Mat3::Zero();
 
   std::function<void(const FrameReport&)> callback_;
 };

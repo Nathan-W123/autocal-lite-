@@ -122,6 +122,24 @@ convergence (`time_offset_ignored`). Two details keep the timing exact:
 (`G = I − ½[δθ]×` each) and moving the clone to the current pose: `P ← J P Jᵀ`, with `J`
 copying the current-pose rows into the clone slots.
 
+**Pixel noise, estimated online.** The compression gives the noise level for free. Write the
+stacked residual as `r = H δx + n` with `n ~ N(0, λσ₀²I)`, where `σ₀` is the configured pixel
+noise and `λ` the unknown ratio to the truth. The last `m − 28` rows of `Qᵀr` are orthogonal
+to the range of `H`, so they contain `Qᵀn` only: `E‖r_out‖² = (m − 28) λσ₀²`, whatever the state
+error and whatever `P` says. Each frame therefore gives an unbiased estimate of `λ` from
+about 5 × 109 − 28 ≈ 520 degrees of freedom (±6 %), and a running mean over 20 frames rescales
+`R`. The
+gate interacts with it: if the noise is under-configured, the per-landmark gate first rejects
+the noisiest landmarks and the estimate starts low, but each step widens the gate and the
+iteration converges to the true value within a few seconds. Over 50 runs each, the final estimate
+lands within ±1.5 % of the truth whether the noise is configured right (0.493–0.505 px for
+0.5 px), at half the truth (0.985–1.008 px for 1.0 px) or at twice the truth (0.493–0.505 px
+for 0.5 px); `tests/test_status.cpp` checks all three. With 2× real noise and estimation off, the filter
+is confidently wrong (NEES 24, 39 / 50 runs within spec); with it on, NEES is 1.5 and
+50 / 50 runs converge. Only the pixel noise is estimated. The IMU noise parameters are not:
+they enter through `Q`, whose errors are not separable from the state error in the same
+clean way.
+
 ## 5. Initialisation (no ground truth)
 
 The rig is held still for the first 2 s. The filter averages 1.5 s of IMU data and checks
@@ -195,7 +213,8 @@ the behaviour a self-checking calibrator should have.
 
 ## 8. Consistency, honestly
 
-* **Vision NIS per dof ≈ 1.00.** The pixel noise model matches the data.
+* **Vision NIS per dof ≈ 1.00.** The pixel noise model matches the data, by construction once
+  it is estimated online (§4).
 * **Extrinsic NEES ≈ 2.0** against 6 expected on a stationary mount (2.7 with the random walk
   switched off), so the filter is **conservative** by about 1.4–1.7× in σ. Every frame is used
   twice, as the "current" view of one update and the anchor of the next, so consecutive
@@ -212,3 +231,39 @@ the behaviour a self-checking calibrator should have.
   1 rad/s, and it showed up as a systematic, seed-independent 0.3° extrinsic error during
   convergence. `tests/test_calibrator.cpp` now pins propagation accuracy and its O(dt²)
   convergence order.
+
+## 9. Self-assessment
+
+`ExtrinsicCalibrator::status()` turns the covariance into something an operator, or a
+supervising process, can act on:
+
+* **Bounds along the least-certain directions.** The rotation and lever-arm blocks of `P` are
+  eigen-decomposed, and the bound is `k σ_max` along the largest eigenvector (`k = 2` by
+  default). A single badly observed direction then cannot hide behind two good ones, as it
+  would in a per-axis or trace-based summary. The directions are reported as unit vectors in
+  the IMU frame. The rotation error is a camera-frame rotation vector, so its axis is rotated
+  by `R_IC`.
+* **State.** *Converged* when the rotation and lever-arm bounds are inside 0.5° / 1 cm (the
+  acceptance criteria) and the time-offset bound is inside 1 ms. *Recalibrating* from a
+  detected knock until converged again.
+* **Why 2σ.** The covariance is conservative (NEES ≈ 2 against 6, §8), so a filter σ is about
+  1.7 true σ, and a 2σ filter bound is roughly 3.4 true σ. Across 300 runs of the scenarios
+  where the model holds, the status never claimed convergence while the true error was
+  outside the bounds. It certifies about 10 s after the true error gets inside (16 s against 6 s
+  at p50). A 3σ bound certified at 34 s and, with 2× pixel noise, not at all within 60 s,
+  for no gain in safety. A consistent covariance (a sliding window, so each observation is
+  used once) would call for re-tuning this choice.
+* **Advice.** A direction `a` of the lever arm, or an axis `a` of the rotation, is invisible to
+  rotation about `a` itself and observed only by rotation about the perpendicular axes. The
+  filter keeps a running second moment `M` of the body rate (5 s time constant), so the
+  rate available to observe `a` is `√(tr M − aᵀMa)`. Below 0.1 rad/s the status says the
+  direction *needs motion* and names the two rotations that would observe it; below 0.3 rad/s
+  it says convergence is *slow* and which rotations would speed it up; otherwise it reports
+  the remaining bound.
+
+What it cannot see: anything the model does not contain. With the timing model wrong
+(`time_offset_ignored`), with the noise model wrong and not estimated
+(`noise_misspecified_fixed`), or with the mount moving faster than the random walk allows and
+no detector (`drift_frozen`, `knock_no_detector`), the covariance is wrong and so is the
+verdict. The evaluation shows these false claims explicitly, next to the zero for the
+scenarios where the model holds.

@@ -58,6 +58,9 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
   double track_sq = 0.0, track_max = 0.0, track_max_t = 0.0;
   int track_count = 0;
   bool horizon_recorded = false;
+  const double rot_tol_deg = config.calib.converged_rotation_bound * constants::kRadToDeg;
+  const double trans_tol = config.calib.converged_translation_bound;
+  double status_settled_since = -1.0;  // start of the current run of "converged" statuses
 
   calibrator.setFrameCallback([&](const FrameReport& rep) {
     const Extrinsic est = calibrator.extrinsic();
@@ -68,6 +71,20 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
     const double trans = dpos.norm();
     scores.push_back({rep.time, rot_deg, trans});
     if (rep.change_detected) result.change_times.push_back(rep.time);
+
+    const CalibrationStatus status = calibrator.status();
+    const bool says_converged = status.state == CalibrationState::kConverged;
+    if (says_converged) {
+      ++result.status_converged_frames;
+      if (!(rot_deg <= rot_tol_deg && trans <= trans_tol)) ++result.false_confidence_frames;
+      if (status_settled_since < 0.0) status_settled_since = rep.time;
+    } else {
+      status_settled_since = -1.0;
+    }
+    if (rep.time <= config.convergence_horizon + 1e-9) {
+      result.status_converged_at_horizon = says_converged;
+      result.status_convergence_time = says_converged ? status_settled_since : -1.0;
+    }
     if (rep.updated) {
       ++result.frames_fused;
       nis_sum += rep.nis_per_dof;
@@ -117,6 +134,10 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
       s.accel_bias_error = (sim.truthAccelBias() - calibrator.accelBias()).norm();
       s.nis_per_dof = rep.nis_per_dof;
       s.landmarks_used = rep.used;
+      s.pixel_sigma = status.pixel_sigma;
+      s.state = status.state;
+      s.rotation_bound_deg = status.rotation_bound * constants::kRadToDeg;
+      s.translation_bound = status.translation_bound;
       const KinematicState truth_state = sim.truthState(rep.time);
       const MatX& P = calibrator.covariance();
       s.velocity_error = truth_state.velocity - calibrator.velocity();
@@ -143,6 +164,8 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
   while (k < sim.frameCount()) calibrator.addFrame(sim.frame(k++));  // still in flight at the end
   calibrator.flush();
   result.frames_dropped = calibrator.droppedFrames();
+  result.final_status = calibrator.status();
+  result.final_pixel_sigma = calibrator.pixelSigma();
 
   // --- Scores --------------------------------------------------------------------------
   const Extrinsic est = calibrator.extrinsic();
@@ -161,6 +184,10 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
   // A run shorter than the horizon cannot certify convergence "within the horizon".
   const bool horizon_covered =
       horizon_recorded && config.sim.duration >= config.convergence_horizon - 1e-9;
+  if (!horizon_covered) {
+    result.status_converged_at_horizon = false;
+    result.status_convergence_time = -1.0;
+  }
   result.tracking_samples = track_count;
   if (track_count > 0) {
     result.tracking_rms_error_deg = std::sqrt(track_sq / track_count);
@@ -202,8 +229,10 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
 }
 
 std::vector<std::string> scenarioNames() {
-  return {"convergence", "drift",    "drift_frozen", "knock",
-          "knock_no_detector", "time_offset", "time_offset_ignored", "yaw_only", "outliers"};
+  return {"convergence",        "drift",          "drift_frozen",
+          "knock",              "knock_no_detector", "time_offset",
+          "time_offset_ignored", "noise_misspecified", "noise_misspecified_fixed",
+          "yaw_only",           "outliers"};
 }
 
 TrialConfig scenario(const std::string& name) {
@@ -240,6 +269,11 @@ TrialConfig scenario(const std::string& name) {
     c.sim.duration = 60.0;
     c.sim.time_offset = 0.0025;
     c.calib.estimate_time_offset = false;
+  } else if (name == "noise_misspecified" || name == "noise_misspecified_fixed") {
+    // The pixels are twice as noisy as the filter is told (1.0 px vs 0.5 px).
+    c.sim.duration = 60.0;
+    c.sim.pixel_noise = 1.0;
+    c.calib.adapt_pixel_noise = (name == "noise_misspecified");
   } else if (name == "yaw_only") {
     c.sim.duration = 60.0;
     c.sim.trajectory.euler_amplitude = Vec3(0.0, 0.0, 0.45);
@@ -274,6 +308,11 @@ void applyOverride(TrialConfig* c, const std::string& assignment) {
     c->sim.pixel_noise = v;
   } else if (key == "pixel_sigma") {
     c->calib.pixel_sigma = v;
+  } else if (key == "status_sigma") {
+    if (!(v > 0.0)) throw std::invalid_argument("status_sigma must be positive");
+    c->calib.status_sigma_multiplier = v;
+  } else if (key == "adapt_pixel_noise") {
+    c->calib.adapt_pixel_noise = v != 0.0;
   } else if (key == "rot_walk") {
     c->calib.extrinsic_rotation_walk = v;
   } else if (key == "trans_walk") {
