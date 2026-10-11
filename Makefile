@@ -6,7 +6,7 @@
 #   make test          run the Catch2 suite (make ctest runs it through CTest)
 #   make run           one 60 s convergence run, prints its scores
 #   make monte-carlo   the 50-run campaigns behind the results table
-#   make eval          campaigns + convergence table + drift-tracking plot data (+ figures)
+#   make eval          campaigns + sensitivity checks + every results table + plot data (+ figures)
 #   make clean         remove the build directory
 # =============================================================================================
 

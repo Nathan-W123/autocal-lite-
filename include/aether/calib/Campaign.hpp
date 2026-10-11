@@ -96,7 +96,11 @@ struct TrialResult {
   double final_gyro_bias_error = 0.0;    ///< [rad/s]
   double final_accel_bias_error = 0.0;   ///< [m/s^2]
   double mean_nees = 0.0;          ///< Mean extrinsic NEES after the first 10 s (6 expected)
-  double mean_nis_per_dof = 0.0;   ///< Mean vision NIS per dof (1 expected)
+  /// Mean vision NIS per dof of the state-dependent rows (tests H P H^T + R; 1 expected)
+  double mean_nis_per_dof = 0.0;
+  /// Mean residual energy outside the range of H per dof over the pixel variance in use
+  /// (tests the noise level alone; 1 expected when the noise estimate is right)
+  double mean_noise_check = 0.0;
   double mean_landmarks_used = 0.0;
   int frames_fused = 0;
   int frames_dropped = 0;          ///< Frames that arrived too late to be fused (0 expected).
@@ -110,8 +114,16 @@ struct TrialResult {
   double status_convergence_time = -1.0;
   int status_converged_frames = 0;   ///< Frames on which the status said "converged".
   /// Frames on which the status said "converged" while the true error was outside the
-  /// converged bounds (rotation or lever arm). This is the number that must stay at 0.
+  /// acceptance tolerance (CalibratorConfig::converged_rotation_bound / _translation_bound,
+  /// 0.5 deg / 1 cm by default). This is the number that must stay at 0.
   int false_confidence_frames = 0;
+  /// The part of false_confidence_frames that came after the change detector had fired, i.e.
+  /// once the filter had been told the mount moved (the rest are detection latency).
+  int false_confidence_after_detection = 0;
+  /// Frames on which the status said "converged" while the true error exceeded the status's
+  /// own k-sigma bounds (rotation_bound / translation_bound). These are filter sigmas, not
+  /// guarantees, so this is expected to be small but not zero.
+  int outside_bound_frames = 0;
   double final_pixel_sigma = 0.0;    ///< Pixel noise the filter ended up assuming [px]
   bool static_init_ok = false;
   double wall_clock_seconds = 0.0;
@@ -145,10 +157,15 @@ std::vector<std::string> scenarioNames();
 ///
 /// Used by the apps' `--set` option for sweeps and ablations. Keys (units as in the structs):
 /// `duration`, `prior_rot_deg`, `prior_trans_m`, `pixel_noise` (truth), `pixel_sigma`
-/// (assumed), `rot_walk`, `trans_walk`, `landmarks`, `camera_rate`, `time_offset` (truth),
-/// `estimate_time_offset` (0/1), `outlier_fraction`, `landmark_gate`, `detect_change` (0/1),
-/// `adapt_pixel_noise` (0/1), `drift_rate_deg_per_min`, `drift_start`, `tracking_start`, `roll_pitch_scale`,
-/// `yaw_scale`, `gyro_noise_scale`, `accel_noise_scale`, `series_interval`.
+/// (assumed), `adapt_pixel_noise` (0/1), `status_sigma`, `rot_walk`, `trans_walk`,
+/// `landmarks`, `camera_rate`, `time_offset` (truth), `estimate_time_offset` (0/1),
+/// `outlier_fraction`, `landmark_gate`, `detect_change` (0/1), `change_threshold`,
+/// `change_window`, `knock_rot_deg`, `knock_trans_m`, `reopen_rot_deg`, `reopen_trans_m`,
+/// `reopen_nav_scale`, `drift_rate_deg_per_min`, `drift_start`, `tracking_start`,
+/// `roll_pitch_scale`, `yaw_scale`, `gyro_noise_scale`, `accel_noise_scale`,
+/// `yaw_gauge_noise`, `disjoint_pairs` (0/1), `init_attitude_deg`, `init_velocity_sigma`,
+/// `init_accel_bias_sigma`, `accel_bias_initial`, `gyro_bias_initial`, `noise_free` (0/1),
+/// `frame_latency`, `series_interval`.
 /// \throws std::invalid_argument on an unknown key or malformed value.
 void applyOverride(TrialConfig* config, const std::string& assignment);
 

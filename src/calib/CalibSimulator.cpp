@@ -96,13 +96,17 @@ StereoFrame CalibSimulator::frame(int k) {
 
     StereoObservation o;
     o.id = static_cast<int>(j);
-    o.left = uv_l + cfg_.pixel_noise * Vec2(rng_pixels_.gaussian(), rng_pixels_.gaussian());
-    o.right = uv_r + cfg_.pixel_noise * Vec2(rng_pixels_.gaussian(), rng_pixels_.gaussian());
+    // One draw per statement: argument evaluation order differs between compilers.
+    double noise[4];
+    for (double& n : noise) n = rng_pixels_.gaussian();
+    o.left = uv_l + cfg_.pixel_noise * Vec2(noise[0], noise[1]);
+    o.right = uv_r + cfg_.pixel_noise * Vec2(noise[2], noise[3]);
     if (cfg_.outlier_fraction > 0.0 && rng_pixels_.uniform() < cfg_.outlier_fraction) {
       // A wrong correspondence: a random point with a plausible positive disparity.
       // The left pixel starts 40 px in so the right one stays on the sensor.
-      o.left = Vec2(rng_pixels_.uniform(40.0, cam.width - 1.0),
-                    rng_pixels_.uniform(0.0, cam.height - 1.0));
+      const double u = rng_pixels_.uniform(40.0, cam.width - 1.0);
+      const double v = rng_pixels_.uniform(0.0, cam.height - 1.0);
+      o.left = Vec2(u, v);
       o.right = Vec2(o.left.x() - rng_pixels_.uniform(2.0, 40.0), o.left.y());
     }
     out.observations.push_back(o);

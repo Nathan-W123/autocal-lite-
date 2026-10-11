@@ -177,7 +177,8 @@ int main(int argc, char** argv) {
     sum.has_tracking = cfg.tracking_start >= 0.0;
     sum.tracking_threshold_deg = kTrackingThresholdDeg;
     std::vector<double> hr, ht, fr, ft, ct, tm, tr, tt, nees, nis, td, bg, ba, wall, lm, rec,
-        events, latency, pixel, false_conf, status_time;
+        events, latency, pixel, false_conf, false_after, outside_bound, status_frames,
+        status_time, noise_check;
     std::vector<calib::TrialResult> valid;
     for (std::size_t i = 0; i < run.results.size(); ++i) {
       const auto& t = run.results[i];
@@ -208,12 +209,16 @@ int main(int argc, char** argv) {
       events.push_back(static_cast<double>(t.change_events));
       pixel.push_back(t.final_pixel_sigma);
       false_conf.push_back(static_cast<double>(t.false_confidence_frames));
+      false_after.push_back(static_cast<double>(t.false_confidence_after_detection));
+      outside_bound.push_back(static_cast<double>(t.outside_bound_frames));
+      status_frames.push_back(static_cast<double>(t.status_converged_frames));
       if (t.status_converged_at_horizon) {
         ++sum.status_converged;
         status_time.push_back(t.status_convergence_time);
       }
       nees.push_back(t.mean_nees);
       nis.push_back(t.mean_nis_per_dof);
+      noise_check.push_back(t.mean_noise_check);
       td.push_back(1000.0 * t.final_time_offset_error);
       bg.push_back(t.final_gyro_bias_error);
       ba.push_back(t.final_accel_bias_error);
@@ -234,9 +239,13 @@ int main(int argc, char** argv) {
                  mc::computeStatistics("detection_latency", "s", latency),
                  mc::computeStatistics("final_pixel_sigma", "px", pixel),
                  mc::computeStatistics("false_confidence_frames", "-", false_conf),
+                 mc::computeStatistics("false_confidence_after_detection", "-", false_after),
+                 mc::computeStatistics("outside_bound_frames", "-", outside_bound),
+                 mc::computeStatistics("status_converged_frames", "-", status_frames),
                  mc::computeStatistics("status_convergence_time", "s", status_time),
                  mc::computeStatistics("mean_nees", "-", nees),
                  mc::computeStatistics("mean_nis_per_dof", "-", nis),
+                 mc::computeStatistics("mean_noise_check", "-", noise_check),
                  mc::computeStatistics("final_time_offset_error", "ms", td),
                  mc::computeStatistics("final_gyro_bias_error", "rad/s", bg),
                  mc::computeStatistics("final_accel_bias_error", "m/s^2", ba),
@@ -257,7 +266,10 @@ int main(int argc, char** argv) {
                          "mean_nees", "mean_nis_per_dof", "mean_landmarks_used",
                          "frames_fused", "frames_dropped", "change_events", "static_init_ok",
                          "final_pixel_sigma", "status_converged", "status_convergence_time_s",
-                         "false_confidence_frames", "final_state", "weakest_trans_axis_x",
+                         "false_confidence_frames", "false_confidence_after_detection",
+                         "outside_bound_frames",
+                         "status_converged_frames", "mean_noise_check", "final_state",
+                         "weakest_trans_axis_x",
                          "weakest_trans_axis_y", "weakest_trans_axis_z", "wall_clock_s"});
       for (std::size_t i = 0; i < run.results.size(); ++i) {
         const auto& t = run.results[i];
@@ -275,6 +287,9 @@ int main(int argc, char** argv) {
                     static_cast<double>(t.change_events), t.static_init_ok ? 1.0 : 0.0,
                     t.final_pixel_sigma, t.status_converged_at_horizon ? 1.0 : 0.0,
                     t.status_convergence_time, static_cast<double>(t.false_confidence_frames),
+                    static_cast<double>(t.false_confidence_after_detection),
+                    static_cast<double>(t.outside_bound_frames),
+                    static_cast<double>(t.status_converged_frames), t.mean_noise_check,
                     static_cast<double>(t.final_status.state),
                     t.final_status.weakest_translation_axis.x(),
                     t.final_status.weakest_translation_axis.y(),

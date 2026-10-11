@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <limits>
+#include <numeric>
 #include <string>
+#include <vector>
 
 #include "aether/calib/MeasurementModel.hpp"
 #include "aether/estimation/EskfCore.hpp"
@@ -18,6 +21,15 @@ namespace {
 constexpr int kNx = ExtrinsicCalibrator::kStateDim;
 constexpr int kNn = ExtrinsicCalibrator::kNavDim;
 constexpr int kNr = kNx - kNn;  // extrinsic, time offset and clone: no dynamics
+// Robust pixel-noise estimate: at most this many passes, each dropping the landmarks whose
+// residual energy exceeds kNoiseFitTrim times that pass's noise variance (chi^2_5 at 99.9 %,
+// so a clean landmark is dropped with probability ~1e-3).
+constexpr int kNoiseFitPasses = 3;
+constexpr double kNoiseFitTrim = 20.5;
+// Gross mismatches are screened out of the noise estimate by the landmark gate evaluated with
+// this many times the current pixel-noise variance (10x the sigma): wide enough that a noise
+// value wrong by up to the clamp cannot reject clean landmarks.
+constexpr double kNoiseCoarseGateVariance = 100.0;
 
 /// Linear interpolation of an IMU sample at time \a t inside [a.time, b.time].
 sensors::ImuSample interpolate(const sensors::ImuSample& a, const sensors::ImuSample& b,
@@ -230,6 +242,7 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
   FrameReport report;
   report.time = time_;
   report.observations = static_cast<int>(frame.observations.size());
+  report.noise_scale = noise_scale_;
 
   if (!has_clone_) {
     cloneCurrentPose(gyro_at_frame - bg_, frame.stamp + td_ - time_);
@@ -243,7 +256,6 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
   ViewPose anchor{math::quatToRotation(clone_q_), clone_p_, clone_omega_, clone_v_};
   ViewPose current{math::quatToRotation(q_wi_), p_, gyro_at_frame - bg_, v_};
   const double var_cfg = cfg_.pixel_sigma * cfg_.pixel_sigma;
-  const double var_px = var_cfg * noise_scale_;
 
   // Landmarks in both frames (both observation lists are sorted by id).
   std::vector<std::pair<std::size_t, std::size_t>> matches;
@@ -263,9 +275,12 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
   }
   report.matched = static_cast<int>(matches.size());
 
-  MatX H_stack(5 * static_cast<Eigen::Index>(matches.size()), kNx);
-  VecX r_stack(5 * static_cast<Eigen::Index>(matches.size()));
-  int used = 0;
+  // Pass 1: every matched landmark's marginalised residual and Jacobian (5 rows each), and its
+  // predicted state uncertainty H P H^T for the gates.
+  MatX H_cand(5 * static_cast<Eigen::Index>(matches.size()), kNx);
+  VecX r_cand(5 * static_cast<Eigen::Index>(matches.size()));
+  MatX HPH_cand(5 * static_cast<Eigen::Index>(matches.size()), 5);
+  int candidates = 0;
 
   using Mat83 = Eigen::Matrix<double, 8, 3>;
   using Vec8 = Eigen::Matrix<double, 8, 1>;
@@ -324,18 +339,97 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
     const Eigen::Matrix<double, 5, 1> r_o = N.transpose() * r;
     const Eigen::Matrix<double, 5, kNx> H_o = N.transpose() * Hx;
 
-    // Per-landmark Mahalanobis gate (rejects bad correspondences).
-    if (cfg_.landmark_gate > 0.0) {
-      Eigen::Matrix<double, 5, 5> S = H_o * P_ * H_o.transpose();
-      S.diagonal().array() += var_px;
-      const double d2 = r_o.dot(S.ldlt().solve(r_o));
-      if (!(d2 <= cfg_.landmark_gate)) {
-        ++report.gated;
-        continue;
+    H_cand.middleRows<5>(5 * candidates) = H_o;
+    r_cand.segment<5>(5 * candidates) = r_o;
+    HPH_cand.middleRows<5>(5 * candidates) = H_o * P_ * H_o.transpose();
+    ++candidates;
+  }
+
+  // Per-landmark chi-square of the 5-dof residual against H P H^T + var I.
+  auto landmarkChi2 = [&](int j, double var) {
+    Eigen::Matrix<double, 5, 5> S = HPH_cand.middleRows<5>(5 * j);
+    S.diagonal().array() += var;
+    const Eigen::Matrix<double, 5, 1> r_o = r_cand.segment<5>(5 * j);
+    return r_o.dot(S.ldlt().solve(r_o));
+  };
+
+  // Pixel noise, measured before the gate so that a badly configured value cannot make the
+  // gate reject the data that would correct it.
+  //  1. Gross mismatches are screened out by the landmark gate at 10x the current noise sigma.
+  //  2. The stacked residuals of the rest are projected off the 28 columns of Q in H = QR,
+  //     which contain every state direction whatever the rank of H. What is left has 5n - 28
+  //     degrees of freedom of pure noise, independent of the state error and of P. Landmark j's
+  //     share has energy ~ sigma^2 chi^2 with about (5n - 28)/n dof, so the median over
+  //     landmarks gives sigma^2.
+  //  3. A wrong correspondence that survived step 1 leaks into every landmark through the
+  //     projection, so the landmarks far outside that noise level are dropped and step 2 is
+  //     repeated without them.
+  std::vector<int> inliers;
+  if (cfg_.adapt_pixel_noise) {
+    const double var_coarse = kNoiseCoarseGateVariance * var_cfg * noise_scale_;
+    for (int j = 0; j < candidates; ++j)
+      if (cfg_.landmark_gate <= 0.0 || landmarkChi2(j, var_coarse) <= cfg_.landmark_gate)
+        inliers.push_back(j);
+  }
+  if (static_cast<int>(inliers.size()) >= cfg_.min_landmarks) {
+    std::vector<double> energy;
+    double scale_frame = 0.0;
+    for (int pass = 0; pass < kNoiseFitPasses; ++pass) {
+      const int n = static_cast<int>(inliers.size());
+      const Eigen::Index rows = 5 * static_cast<Eigen::Index>(n);
+      if (rows <= kNx) break;
+      MatX Hi(rows, kNx);
+      VecX e(rows);
+      for (int i = 0; i < n; ++i) {
+        Hi.middleRows<5>(5 * i) = H_cand.middleRows<5>(5 * inliers[static_cast<std::size_t>(i)]);
+        e.segment<5>(5 * i) = r_cand.segment<5>(5 * inliers[static_cast<std::size_t>(i)]);
       }
+      const Eigen::HouseholderQR<MatX> qr(Hi);
+      e.applyOnTheLeft(qr.householderQ().adjoint());
+      e.head(kNx).setZero();
+      e.applyOnTheLeft(qr.householderQ());
+      energy.resize(static_cast<std::size_t>(n));
+      for (int i = 0; i < n; ++i)
+        energy[static_cast<std::size_t>(i)] = e.segment<5>(5 * i).squaredNorm();
+      std::vector<double> sorted = energy;
+      auto mid = sorted.begin() + static_cast<std::ptrdiff_t>(sorted.size() / 2);
+      std::nth_element(sorted.begin(), mid, sorted.end());
+      // Median of chi^2 with k dof (Wilson-Hilferty): k (1 - 2/(9k))^3.
+      const double k = static_cast<double>(rows - kNx) / n;
+      const double chi2_median = k * std::pow(1.0 - 2.0 / (9.0 * k), 3);
+      const double var_hat = *mid / chi2_median;
+      scale_frame = var_hat / var_cfg;
+      std::vector<int> kept;
+      for (int i = 0; i < n; ++i)
+        if (energy[static_cast<std::size_t>(i)] <= kNoiseFitTrim * var_hat)
+          kept.push_back(inliers[static_cast<std::size_t>(i)]);
+      if (kept.size() == inliers.size() || static_cast<int>(kept.size()) < cfg_.min_landmarks)
+        break;
+      inliers = std::move(kept);
     }
-    H_stack.middleRows<5>(5 * used) = H_o;
-    r_stack.segment<5>(5 * used) = r_o;
+    if (std::isfinite(scale_frame) && scale_frame > 0.0) {
+      if (!noise_scale_initialised_) {
+        noise_scale_ = scale_frame;  // no warm-up from the configured value
+        noise_scale_initialised_ = true;
+      } else {
+        noise_scale_ += (scale_frame - noise_scale_) / std::max(cfg_.noise_adaptation_frames, 1);
+      }
+      noise_scale_ = std::clamp(noise_scale_, cfg_.min_noise_scale, cfg_.max_noise_scale);
+    }
+  }
+  const double var_px = var_cfg * noise_scale_;
+
+  // Pass 2: per-landmark Mahalanobis gate (rejects bad correspondences).
+  MatX H_stack(5 * static_cast<Eigen::Index>(candidates), kNx);
+  VecX r_stack(5 * static_cast<Eigen::Index>(candidates));
+  int used = 0;
+  for (int j = 0; j < candidates; ++j) {
+    if (cfg_.landmark_gate > 0.0 && !(landmarkChi2(j, var_px) <= cfg_.landmark_gate)) {
+      ++report.gated;
+      continue;
+    }
+    H_stack.middleRows<5>(5 * used) = H_cand.middleRows<5>(5 * j);
+    r_stack.segment<5>(5 * used) = r_cand.segment<5>(5 * j);
     ++used;
   }
   report.used = used;
@@ -352,21 +446,8 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
       H = qr.matrixQR().topRows(kNx).triangularView<Eigen::Upper>();
       residual_outside = qtr.tail(rows - kNx).squaredNorm();
       r = qtr.head(kNx);
-
-      // The rows - 28 residual components outside the range of H are orthogonal to every
-      // state direction, so they hold pixel noise only: E[|r_out|^2] = (rows - 28) sigma^2.
-      // That measures the true noise without depending on P, and a running mean of it
-      // rescales the configured noise.
-      if (cfg_.adapt_pixel_noise) {
-        const double scale_frame =
-            residual_outside / (static_cast<double>(rows - kNx) * var_cfg);
-        const double gain = 1.0 / std::max(cfg_.noise_adaptation_frames, 1);
-        noise_scale_ = std::clamp(noise_scale_ + gain * (scale_frame - noise_scale_),
-                                  cfg_.min_noise_scale, cfg_.max_noise_scale);
-      }
     }
-    const double var_update = var_cfg * noise_scale_;
-    const MatX R = MatX::Identity(H.rows(), H.rows()) * var_update;
+    const MatX R = MatX::Identity(H.rows(), H.rows()) * var_px;
     const Eigen::Matrix<double, 6, 6> P_ext_prior = P_.block<6, 6>(kIdxExtRotation, kIdxExtRotation);
     const estimation::UpdateResult upd = estimation::josephUpdate(P_, r, H, R, 0.0);
     if (upd.accepted) {
@@ -374,9 +455,12 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
           P_ext_prior - P_.block<6, 6>(kIdxExtRotation, kIdxExtRotation);
       injectAndReset(upd.dx);
       report.updated = true;
-      const double dof = static_cast<double>(rows);
-      const double nis = upd.nis + residual_outside / var_update;
-      report.nis_per_dof = nis / dof;
+      // Consistency of the state-dependent part: the (at most 28) compressed rows test the
+      // predicted covariance H P H^T + R. The rows outside the range of H test the noise
+      // level only, which the estimate above already sets, so they are reported apart.
+      report.nis_per_dof = upd.nis / static_cast<double>(H.rows());
+      if (rows > kNx)
+        report.noise_check = residual_outside / (static_cast<double>(rows - kNx) * var_px);
 
       const VecX ext_var = P_.diagonal().segment<6>(kIdxExtRotation);
       const bool armed =
@@ -407,8 +491,11 @@ void ExtrinsicCalibrator::fuseFrame(const StereoFrame& frame, const Vec3& gyro_a
           }
         }
       }
-      if (recalibrating_ && status().state == CalibrationState::kConverged)
-        recalibrating_ = false;
+      if (recalibrating_) {
+        const CalibrationStatus s = status();
+        if (s.rotation_converged && s.translation_converged && s.time_offset_converged)
+          recalibrating_ = false;
+      }
     }
   }
   report.noise_scale = noise_scale_;
@@ -469,6 +556,16 @@ void ExtrinsicCalibrator::reopenExtrinsic() {
   const double st = cfg_.reopen_translation_sigma;
   P_.block<3, 3>(kIdxExtRotation, kIdxExtRotation) = Mat3::Identity() * sr * sr;
   P_.block<3, 3>(kIdxExtTranslation, kIdxExtTranslation) = Mat3::Identity() * st * st;
+  // Between the knock and its detection the navigation states were updated through the wrong
+  // extrinsic with full confidence, so they carry part of the change too: loosen them as well,
+  // or the filter re-converges over-confident (its bounds then certify an estimate that is
+  // still settling).
+  for (int i = 0; i < 3; ++i) {
+    P_(kIdxAttitude + i, kIdxAttitude + i) += std::pow(cfg_.reopen_attitude_sigma, 2);
+    P_(kIdxVelocity + i, kIdxVelocity + i) += std::pow(cfg_.reopen_velocity_sigma, 2);
+    P_(kIdxGyroBias + i, kIdxGyroBias + i) += std::pow(cfg_.reopen_gyro_bias_sigma, 2);
+    P_(kIdxAccelBias + i, kIdxAccelBias + i) += std::pow(cfg_.reopen_accel_bias_sigma, 2);
+  }
   ++change_events_;
   recalibrating_ = true;
 }

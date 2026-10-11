@@ -133,7 +133,8 @@ int main(int argc, char** argv) {
   std::cout << "bias error          gyro " << r.final_gyro_bias_error << " rad/s, accel "
             << r.final_accel_bias_error << " m/s^2\n"
             << "consistency         mean NEES " << r.mean_nees << " (6 expected), mean NIS/dof "
-            << r.mean_nis_per_dof << " (1 expected)\n"
+            << r.mean_nis_per_dof << " (1 expected), noise check " << r.mean_noise_check
+            << " (1 expected)\n"
             << "change events       " << r.change_events;
   for (double t : r.change_times) std::cout << (t == r.change_times.front() ? "  at " : ", ") << t << " s";
   const calib::CalibrationStatus& st = r.final_status;
@@ -147,8 +148,13 @@ int main(int argc, char** argv) {
             << "-sigma, least-certain directions)\n"
             << "  converged at " << cfg.convergence_horizon << " s  "
             << (r.status_converged_at_horizon ? "yes" : "no") << ", since " << r.status_convergence_time
-            << " s; frames claiming convergence with the truth outside the bounds: "
-            << r.false_confidence_frames << "\n"
+            << " s\n"
+            << "  'converged' frames " << r.status_converged_frames << ", of which truth outside the "
+            << cfg.calib.converged_rotation_bound * constants::kRadToDeg << " deg / "
+            << 100.0 * cfg.calib.converged_translation_bound << " cm tolerance: "
+            << r.false_confidence_frames << " (" << r.false_confidence_after_detection
+            << " after a detected change), outside the self-assessed bounds: "
+            << r.outside_bound_frames << "\n"
             << "series              " << path << "\n";
   return r.ok ? 0 : 1;
 }

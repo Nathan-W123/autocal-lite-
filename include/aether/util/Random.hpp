@@ -1,4 +1,5 @@
-// Reused verbatim from Aether6 (github.com/Nathan-W123/Aether6, MIT, commit 6b8dc56).
+// Reused from Aether6 (github.com/Nathan-W123/Aether6, MIT, commit 6b8dc56); gaussian3() now
+// sequences its draws (see there).
 /// \file Random.hpp
 /// \brief Deterministic, reproducible random-number generation.
 ///
@@ -45,8 +46,15 @@ class Rng {
     return lo + (hi - lo) * uniform_(engine_);
   }
 
-  /// Vector of independent standard normals.
-  Vec3 gaussian3() { return Vec3(gaussian(), gaussian(), gaussian()); }
+  /// Vector of independent standard normals, drawn x, y, z in that order. (The order of
+  /// evaluation of constructor arguments is unspecified, and GCC and Clang differ, so the
+  /// draws are sequenced explicitly to keep a seed's stream the same on every compiler.)
+  Vec3 gaussian3() {
+    const double x = gaussian();
+    const double y = gaussian();
+    const double z = gaussian();
+    return Vec3(x, y, z);
+  }
 
   /// Seed this generator was constructed with.
   std::uint64_t seed() const { return seed_; }

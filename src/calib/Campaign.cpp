@@ -53,7 +53,7 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
   std::vector<FrameScore> scores;
   scores.reserve(static_cast<std::size_t>(sim.frameCount()));
   double next_series = 0.0;
-  double nees_sum = 0.0, nis_sum = 0.0, used_sum = 0.0;
+  double nees_sum = 0.0, nis_sum = 0.0, noise_check_sum = 0.0, used_sum = 0.0;
   int nees_count = 0, nis_count = 0;
   double track_sq = 0.0, track_max = 0.0, track_max_t = 0.0;
   int track_count = 0;
@@ -76,7 +76,12 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
     const bool says_converged = status.state == CalibrationState::kConverged;
     if (says_converged) {
       ++result.status_converged_frames;
-      if (!(rot_deg <= rot_tol_deg && trans <= trans_tol)) ++result.false_confidence_frames;
+      if (!(rot_deg <= rot_tol_deg && trans <= trans_tol)) {
+        ++result.false_confidence_frames;
+        if (!result.change_times.empty()) ++result.false_confidence_after_detection;
+      }
+      if (!(drot.norm() <= status.rotation_bound && trans <= status.translation_bound))
+        ++result.outside_bound_frames;
       if (status_settled_since < 0.0) status_settled_since = rep.time;
     } else {
       status_settled_since = -1.0;
@@ -88,6 +93,7 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
     if (rep.updated) {
       ++result.frames_fused;
       nis_sum += rep.nis_per_dof;
+      noise_check_sum += rep.noise_check;
       used_sum += rep.used;
       ++nis_count;
     }
@@ -178,6 +184,7 @@ TrialResult runTrial(const TrialConfig& config, std::uint64_t seed, int index) {
   result.final_accel_bias_error = (sim.truthAccelBias() - calibrator.accelBias()).norm();
   result.mean_nees = nees_count > 0 ? nees_sum / nees_count : 0.0;
   result.mean_nis_per_dof = nis_count > 0 ? nis_sum / nis_count : 0.0;
+  result.mean_noise_check = nis_count > 0 ? noise_check_sum / nis_count : 0.0;
   result.mean_landmarks_used = nis_count > 0 ? used_sum / nis_count : 0.0;
   result.change_events = calibrator.changeEvents();
   result.static_init_ok = calibrator.staticInitPassed();
@@ -342,6 +349,12 @@ void applyOverride(TrialConfig* c, const std::string& assignment) {
     c->calib.reopen_rotation_sigma = v * constants::kDegToRad;
   } else if (key == "reopen_trans_m") {
     c->calib.reopen_translation_sigma = v;
+  } else if (key == "reopen_nav_scale") {
+    // Scales every navigation-state term of a re-open (0 = extrinsic only).
+    c->calib.reopen_attitude_sigma *= v;
+    c->calib.reopen_velocity_sigma *= v;
+    c->calib.reopen_gyro_bias_sigma *= v;
+    c->calib.reopen_accel_bias_sigma *= v;
   } else if (key == "change_window") {
     if (!(v >= 1.0 && v <= 1e6)) throw std::invalid_argument("change_window must be in [1, 1e6]");
     c->calib.change_window = static_cast<int>(v);

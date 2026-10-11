@@ -459,7 +459,7 @@ TEST_CASE("a start-up window that contains motion fails the stillness test",
 // -------------------------------------------------------------------------------------------
 
 TEST_CASE("yaw-only motion leaves the lever arm along the rotation axis unobservable",
-          "[calib][observability]") {
+          "[calib][observability][slow]") {
   // With roll and pitch amplitudes at 0 the IMU only rotates about its own z axis (R_WI =
   // Rz(psi)). The camera centre is p_WI + R_WI p_IC, so the z component of the lever arm only
   // adds a constant world-z offset to every camera position, indistinguishable from the

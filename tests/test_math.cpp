@@ -496,6 +496,16 @@ TEST_CASE("identically seeded Rng streams are bitwise identical", "[util][random
   REQUIRE(any_difference_from_c);
 }
 
+TEST_CASE("gaussian3 draws its components in x, y, z order", "[util][random]") {
+  // AutoCal-lite: Vec3(gaussian(), gaussian(), gaussian()) left the order to the compiler (GCC
+  // and Clang differ), so the same seed simulated different trials on different compilers.
+  util::Rng a(42), b(42);
+  const Vec3 v = a.gaussian3();
+  CHECK(v.x() == b.gaussian());
+  CHECK(v.y() == b.gaussian());
+  CHECK(v.z() == b.gaussian());
+}
+
 TEST_CASE("scaled gaussian draws have the requested mean and standard deviation",
           "[util][random]") {
   // AutoCal-lite: N = 100000 draws of N(3, 0.5^2). The sample mean has sigma

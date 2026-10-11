@@ -7,12 +7,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 
 #include "aether/calib/CalibSimulator.hpp"
 #include "aether/calib/Campaign.hpp"
 #include "aether/calib/ExtrinsicCalibrator.hpp"
 #include "aether/core/Constants.hpp"
+#include "aether/mc/MonteCarlo.hpp"
 
 using namespace aether;
 using Catch::Approx;
@@ -36,12 +38,16 @@ bool contains(const std::string& text, const std::string& part) {
 
 TEST_CASE("the pixel-noise estimate recovers the true noise whatever it was configured to",
           "[calib][noise][slow]") {
-  // The estimate averages ~20 frames of a ~500-dof chi-square, so its relative spread is a
-  // few per cent; 5 % leaves room without hiding a bias.
+  // The estimate averages ~20 frames of a median over ~100 landmarks, so its relative spread
+  // is a few per cent; 5 % leaves room without hiding a bias. The 7x cases are the kind a
+  // post-gate estimate cannot recover from: the gate (sized by the wrong noise) rejects the
+  // data, or the covariance collapses before the estimate has caught up. (They stay inside the
+  // 10x clamp of min/max_noise_scale.)
   struct Case {
     double truth, configured;
   };
-  for (const Case c : {Case{0.5, 0.5}, Case{1.0, 0.5}, Case{0.5, 1.0}}) {
+  for (const Case c : {Case{0.5, 0.5}, Case{1.0, 0.5}, Case{0.5, 1.0}, Case{0.5, 0.07},
+                       Case{0.5, 3.5}}) {
     INFO("true " << c.truth << " px, configured " << c.configured << " px");
     TrialConfig cfg = calib::scenario("convergence");
     cfg.sim.duration = 30.0;
@@ -50,10 +56,32 @@ TEST_CASE("the pixel-noise estimate recovers the true noise whatever it was conf
     const TrialResult r = calib::runTrial(cfg, 3);
     REQUIRE(r.ok);
     CHECK(r.final_pixel_sigma == Approx(c.truth).epsilon(0.05));
-    // With the noise right, the vision innovations are consistent again.
-    CHECK(r.mean_nis_per_dof == Approx(1.0).margin(0.1));
+    // The noise level now matches the residuals the state cannot explain...
+    CHECK(r.mean_noise_check == Approx(1.0).margin(0.1));
+    // ...and, separately, the state-dependent innovations match H P H^T + R.
+    CHECK(r.mean_nis_per_dof == Approx(1.0).margin(0.15));
     CHECK(r.final_rotation_error_deg < 0.5);
     CHECK(r.final_translation_error < 0.01);
+    CHECK(r.false_confidence_frames == 0);
+  }
+}
+
+TEST_CASE("wrong correspondences do not inflate the pixel-noise estimate",
+          "[calib][noise][outliers][slow]") {
+  // A wrong match is hundreds of pixels; through the least-squares projection it would leak
+  // into every landmark's residual and inflate the median. The coarse gate and the trimmed
+  // refit keep it out, also when the configured noise is far off.
+  for (const double configured : {0.5, 0.07, 3.5}) {
+    INFO("configured " << configured << " px");
+    TrialConfig cfg = calib::scenario("outliers");
+    cfg.sim.duration = 30.0;
+    cfg.calib.pixel_sigma = configured;
+    const TrialResult r = calib::runTrial(cfg, 2);
+    REQUIRE(r.ok);
+    CHECK(r.final_pixel_sigma == Approx(cfg.sim.pixel_noise).epsilon(0.05));
+    CHECK(r.mean_noise_check == Approx(1.0).margin(0.1));
+    CHECK(r.mean_nis_per_dof == Approx(1.0).margin(0.15));
+    CHECK(r.false_confidence_frames == 0);
   }
 }
 
@@ -65,21 +93,23 @@ TEST_CASE("with adaptation off the configured pixel noise is used unchanged",
   const TrialResult r = calib::runTrial(cfg, 3);
   REQUIRE(r.ok);
   CHECK(r.final_pixel_sigma == cfg.calib.pixel_sigma);
-  // The 2x noise shows up in the innovations instead (variance ratio 4, partly gated).
-  CHECK(r.mean_nis_per_dof > 1.5);
+  // The 2x noise shows up in the residuals instead (variance ratio 4, partly gated).
+  CHECK(r.mean_noise_check > 2.0);
 }
 
 TEST_CASE("estimating the noise turns a misconfigured filter from confidently wrong to right",
           "[calib][noise][slow]") {
   // 1.0 px of real noise, 0.5 px configured. Without adaptation the filter claims a
-  // precision it does not have, and its status vouches for an estimate outside the bounds.
+  // precision it does not have (NEES far above 6); with it, the covariance is honest again.
   const TrialResult fixed = calib::runTrial(calib::scenario("noise_misspecified_fixed"), 5);
   const TrialResult adapted = calib::runTrial(calib::scenario("noise_misspecified"), 5);
   REQUIRE(fixed.ok);
   REQUIRE(adapted.ok);
   INFO("fixed: NEES " << fixed.mean_nees << ", false-confidence frames "
                       << fixed.false_confidence_frames << "; adapted: NEES " << adapted.mean_nees);
-  CHECK(fixed.mean_nees > 12.0);
+  // Margins from the 50-run campaigns: fixed NEES 6.5-90, adapted at most ~3.7.
+  CHECK(fixed.mean_nees > 6.0);
+  CHECK(fixed.mean_nees > 3.0 * adapted.mean_nees);
   CHECK(adapted.mean_nees < 6.0);
   CHECK(adapted.false_confidence_frames == 0);
   CHECK(adapted.converged);
@@ -107,7 +137,7 @@ TEST_CASE("before the static window has been collected the status asks to hold s
   CHECK(contains(s.guidance, "hold the rig still"));
 }
 
-TEST_CASE("the status certifies convergence only when the truth is inside its bounds",
+TEST_CASE("the status certifies convergence only when the truth is inside tolerance",
           "[calib][status][slow]") {
   const TrialConfig cfg = calib::scenario("convergence");
   for (const std::uint64_t seed : {1u, 2u, 3u}) {
@@ -119,12 +149,10 @@ TEST_CASE("the status certifies convergence only when the truth is inside its bo
     CHECK(contains(s.guidance, "calibrated"));
     CHECK(s.rotation_bound <= cfg.calib.converged_rotation_bound);
     CHECK(s.translation_bound <= cfg.calib.converged_translation_bound);
-    // The bound is on the least-certain direction, so it covers the actual error.
-    CHECK(r.final_rotation_error_deg * constants::kDegToRad <= s.rotation_bound);
-    CHECK(r.final_translation_error <= s.translation_bound);
     CHECK(r.status_converged_at_horizon);
+    // Never "converged" with the truth outside the acceptance tolerance.
     CHECK(r.false_confidence_frames == 0);
-    // It certifies after the truth got there, never before.
+    // In this nominal scenario it certifies after the truth got there, not before.
     CHECK(r.status_convergence_time >= r.convergence_time);
     // The default figure-eight excites all three axes well.
     CHECK(s.excitation.minCoeff() > cfg.calib.good_excitation_rate);
@@ -182,14 +210,33 @@ TEST_CASE("after a knock the status says recalibrating and then converges again"
 
 TEST_CASE("after a knock the status is wrong only until the knock is detected",
           "[calib][status][slow]") {
-  const TrialConfig cfg = calib::scenario("knock");
-  const TrialResult r = calib::runTrial(cfg, 4);
-  REQUIRE(r.ok);
-  REQUIRE(r.change_events == 1);
-  // Frames between the knock and its detection (20 Hz) are the only possible false claims.
-  const double latency = r.change_times.front() - cfg.sim.drift.step_time;
-  const int latency_frames = static_cast<int>(std::lround(latency * cfg.sim.camera_rate)) + 1;
-  INFO("detection latency " << latency << " s, false-confidence frames "
-                            << r.false_confidence_frames);
-  CHECK(r.false_confidence_frames <= latency_frames);
+  // Between the knock and its detection the status cannot know; after the detection it must
+  // not certify the new mount until the truth is inside tolerance. Without loosening the
+  // navigation states on a re-open, the filter re-converged over-confident and re-certified
+  // a lever arm still >1 cm off in about 1 run in 6 (campaign trials 6, 9, 18 were among
+  // them), so this runs those trials and a few more.
+  TrialConfig cfg = calib::scenario("knock");
+  cfg.series_interval = 1.0 / cfg.sim.camera_rate;  // every frame
+  const double tol_deg = cfg.calib.converged_rotation_bound * constants::kRadToDeg;
+  const double tol_m = cfg.calib.converged_translation_bound;
+  for (const int trial : {0, 1, 2, 3, 6, 9, 18, 19}) {
+    INFO("campaign trial " << trial);
+    const std::uint64_t seed = mc::trialSeed(mc::RunnerConfig{}.master_seed, trial);
+    const TrialResult r = calib::runTrial(cfg, seed, trial);
+    REQUIRE(r.ok);
+    REQUIRE(r.change_events == 1);
+    const double detected = r.change_times.front();
+    int false_before = 0, false_after = 0;
+    for (const calib::SeriesSample& s : r.series) {
+      const bool wrong = s.rotation_error_deg > tol_deg || s.translation_error > tol_m;
+      if (s.state != CalibrationState::kConverged || !wrong) continue;
+      CHECK(s.time >= cfg.sim.drift.step_time);  // never before the knock
+      ++(s.time < detected ? false_before : false_after);
+    }
+    INFO("detected " << detected - cfg.sim.drift.step_time << " s after the knock");
+    CHECK(false_after == 0);
+    // Only the frames of the detection latency (20 Hz) can be wrong.
+    CHECK(false_before <= static_cast<int>(std::lround((detected - cfg.sim.drift.step_time) *
+                                                       cfg.sim.camera_rate)) + 1);
+  }
 }

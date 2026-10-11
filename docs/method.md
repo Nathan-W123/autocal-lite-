@@ -103,8 +103,8 @@ the 5-dimensional left null space `N` of `H_f` (the last five columns of its Hou
 applied to a two-pose window, and it is why the landmarks never need to enter the state.
 
 **Timing.** The time offset is estimated in every scenario. The lever arm is so tightly
-coupled to timing that an unmodelled 2.5 ms camera lag biases it by 1.5 cm and breaks
-convergence (`time_offset_ignored`). Two details keep the timing exact:
+coupled to timing that an unmodelled 2.5 ms camera lag biases it by about 1 cm (p50; 3.5 cm
+p95) and breaks convergence in more than half of the runs (`time_offset_ignored`). Two details keep the timing exact:
 * When an update moves `t̂_d` by `Δ`, the filter time (the exposure as estimated *before* the
   update) is off by `Δ`. The clone is therefore re-timed to `stamp + t̂_d` (pose shifted by
   `(ω̂Δ, v̂Δ)`) before it becomes the next anchor.
@@ -122,23 +122,52 @@ convergence (`time_offset_ignored`). Two details keep the timing exact:
 (`G = I − ½[δθ]×` each) and moving the clone to the current pose: `P ← J P Jᵀ`, with `J`
 copying the current-pose rows into the clone slots.
 
-**Pixel noise, estimated online.** The compression gives the noise level for free. Write the
-stacked residual as `r = H δx + n` with `n ~ N(0, λσ₀²I)`, where `σ₀` is the configured pixel
-noise and `λ` the unknown ratio to the truth. The last `m − 28` rows of `Qᵀr` are orthogonal
-to the range of `H`, so they contain `Qᵀn` only: `E‖r_out‖² = (m − 28) λσ₀²`, whatever the state
-error and whatever `P` says. Each frame therefore gives an unbiased estimate of `λ` from
-about 5 × 109 − 28 ≈ 520 degrees of freedom (±6 %), and a running mean over 20 frames rescales
-`R`. The
-gate interacts with it: if the noise is under-configured, the per-landmark gate first rejects
-the noisiest landmarks and the estimate starts low, but each step widens the gate and the
-iteration converges to the true value within a few seconds. Over 50 runs each, the final estimate
-lands within ±1.5 % of the truth whether the noise is configured right (0.493–0.505 px for
-0.5 px), at half the truth (0.985–1.008 px for 1.0 px) or at twice the truth (0.493–0.505 px
-for 0.5 px); `tests/test_status.cpp` checks all three. With 2× real noise and estimation off, the filter
-is confidently wrong (NEES 24, 39 / 50 runs within spec); with it on, NEES is 1.5 and
-50 / 50 runs converge. Only the pixel noise is estimated. The IMU noise parameters are not:
-they enter through `Q`, whose errors are not separable from the state error in the same
-clean way.
+**Pixel noise, estimated online.** Write the stacked residual of the `n` matched landmarks as
+`r = H δx + n`, with `n ~ N(0, λσ₀²I)`, where `σ₀` is the configured pixel noise and `λ` the
+unknown ratio to the truth. With `H = QR` (Householder, 28 columns), projecting `r` off the
+first 28 columns of `Q` removes every state direction, whatever the rank of `H`. What is left,
+`e`, holds `5n − 28` degrees of freedom of pure noise: `E‖e‖² = (5n − 28) λσ₀²`, whatever the
+state error and whatever `P` says. Landmark `j`'s share of `e` has energy `≈ λσ₀² χ²_k` with
+`k = (5n − 28)/n ≈ 4.7`. The median over landmarks, divided by the median of `χ²_k`
+(Wilson–Hilferty: `k (1 − 2/9k)³`), therefore estimates `λσ₀²`. The first frame sets the
+estimate and a running mean over 20 frames follows it. `R = λ̂σ₀² I` is then used for both the
+gate and the update. Three choices matter, and each was found by breaking an earlier version:
+
+* **Before the gate.** The first version measured the noise after the per-landmark gate, from
+  the residual the update leaves, and started from the configured value. With the noise
+  configured 4× or more below the truth, the gate (sized by the wrong noise) rejected most
+  landmarks. The few updates that passed collapsed `P`, and by the time the estimate had caught
+  up the covariance was over-confident for good: the status then certified errors outside
+  tolerance. Measured from the data before the gate, the first frame already has it right.
+* **Robust to wrong correspondences.** A wrong match is hundreds of pixels. Through the
+  projection it leaks into every landmark's residual, so even the median inflates (to σ ≈ 5 px
+  with 5 % mismatches; the outlier regression test caught this). Gross mismatches are therefore
+  screened out first, by the landmark gate evaluated at 10× the current noise σ. That is wide
+  enough that a noise value wrong by up to the 10× clamp cannot reject clean landmarks. Then
+  any landmark whose energy is beyond χ²₅(99.9 %) of the estimated level is dropped and the
+  projection repeated (at most 3 passes).
+* **Independent of `P`.** The estimate never uses the covariance, so a wrong covariance cannot
+  talk it into a wrong noise level.
+
+Results, from the committed 50-run campaigns:
+
+* **Configured right** (0.5 px; the `convergence`, `drift`, `time_offset`, `outliers`,
+  `yaw_only` and `knock` campaigns): the final estimate is 0.490–0.516 px, with
+  p50 0.503. The median-based estimate runs about 0.5 % high.
+* **Configured at half the truth** (`noise_misspecified`: 1.0 px real, 0.5 px configured): the
+  estimate is 0.990–1.023 px, NEES is 1.4, and all 50 runs converge. With the estimation off
+  (`noise_misspecified_fixed`), the same runs are confidently wrong: NEES 23, and only 33 / 50
+  runs are within spec.
+* **Configured 10× too low or too high** (0.05 or 5 px), with or without 5 % wrong
+  correspondences: every run converges with unchanged accuracy, and the status never
+  certifies a wrong calibration (README sensitivity checks). The estimates there lie on one
+  side of 0.500 px, because the truth sits exactly on the 10× clamp.
+
+`tests/test_status.cpp` checks single runs at 1×, 2×, ½× and 7× either way, with and without
+wrong correspondences.
+
+Only the pixel noise is estimated. The IMU noise parameters are not: they enter through `Q`,
+whose errors are not separable from the state error in the same clean way.
 
 ## 5. Initialisation (no ground truth)
 
@@ -164,7 +193,9 @@ keeps a large σ along the yaw axis and the lever-arm error there stays near its
 **Slow drift.** A random-walk model with intensity `q` and measurement information rate `J`
 has a steady-state time constant `τ ≈ 1/√(qJ)` and noise `σ² ≈ √(q/J)`. A mount drifting at a
 constant rate `ṙ` is followed with a lag of about `ṙ τ`. The rotation intensity was picked by
-sweeping it on the drift scenario with the final configuration (20 runs per value):
+sweeping it on the drift scenario (20 runs per value). The sweep was run during development,
+before the online noise estimate; it can be repeated with
+`autocal_mc --scenario drift --trials 20 --set rot_walk=<value>`:
 
 | `extrinsic_rotation_walk` [rad/√s] | 1e-5 | 2e-5 | 5e-5 | **1e-4** | 2e-4 |
 |---|---|---|---|---|---|
@@ -190,39 +221,63 @@ consecutive pairs are slightly (negatively) correlated and the filter is conserv
 so `T` is a well-scaled heuristic rather than an exact χ²₆ test, and its threshold is
 validated empirically (no false alarms, below). After a step the filter is dragged
 in one direction update after update and `T` grows quadratically. When `T > 40` (a χ²₆ tail
-probability of 4.6·10⁻⁷), the extrinsic covariance is re-opened (correlations dropped,
-σ = 1° / 1 cm) and the filter re-converges to the new mount within seconds.
+probability of 4.6·10⁻⁷), the covariance is re-opened and the filter re-converges to the new
+mount within seconds.
 
-Two details keep it quiet when nothing has happened:
+It is **armed only once the calibration has converged** (every rotation σ < 0.1° and lever-arm
+σ < 5 mm), so neither the initial convergence nor the re-convergence after a reset can be
+mistaken for a knock. Before this rule, 3 / 50 time-offset runs fired spuriously while `t_d`
+was still settling.
 
-* It is **armed only once the calibration has converged** (every rotation σ < 0.1° and lever-arm
-  σ < 5 mm). Neither the initial convergence nor the re-convergence after a reset can then be
-  mistaken for a knock. Before this rule, 3 / 50 time-offset runs fired spuriously while
-  `t_d` was still settling.
-* The re-open size is matched to a knock, not to the CAD prior. Re-opening to 5° / 5 cm made
-  the first updates overshoot: up to 3.8° of rotation error after a 1.5° knock. With
-  1° / 1 cm the rotation error never exceeds the knock itself. The lever arm still overshoots
-  for a few seconds (3.0 cm p50 for a 1.95 cm knock) while the rotation settles. A 5° / 5 cm
-  knock recovers in 5.3 s (p50).
+Two details make the re-open right, and the status's self-assessment (§9) is what exposed both:
+
+* **Its size is matched to a knock**, not to the CAD prior: the extrinsic is re-opened to
+  σ = 2° / 2 cm, with its correlations dropped. Re-opening to 5° / 5 cm made the first updates
+  overshoot: up to 3.8° of rotation error after a 1.5° knock. 1° / 1 cm (the first default)
+  was too tight for a 5° / 5 cm knock: the filter re-converged over-confident, and the status
+  re-certified a lever arm still more than 1 cm off. Over 50 runs of a 5° / 5 cm knock, 1° / 1 cm gave
+  283 false-claim frames after the detection, and 2° / 2 cm gives none. It also recovers
+  faster: back in tolerance after 3.6 s instead of 8.2 s (p50), and 2.6 s for the 1.5° knock
+  (3.0 s with 1° / 1 cm). The price is some overshoot. After the 1.5° / 1.95 cm knock, the
+  rotation error peaks above the knock in 13 / 50 runs (at most 2.0°), and the lever arm
+  overshoots to 2.9 cm (p50; 2.2 cm with 1° / 1 cm) for a few seconds. Both happen while the
+  status says *recalibrating*.
+* **The navigation states are loosened too.** Between the knock and its detection (0.2–0.4 s),
+  every update pushes part of the knock into the attitude, velocity and biases, with full
+  confidence. Re-opening only the extrinsic leaves that error in states the filter believes it
+  knows, so it re-converges over-confident. A re-open therefore also adds 0.5° of attitude,
+  2 cm/s of velocity, 1e-3 rad/s of gyro bias and 0.05 m/s² of accel bias σ, in quadrature.
+  Without it, the
+  status re-certified a lever arm still more than 1 cm off, several seconds after the
+  detection: 135 frames over 50 runs of the 1.5° knock, and 320 of the 5° knock. With it there
+  are none. The only false claims left are the frames between a knock and its detection
+  (0.25 s, p50).
 
 Because the filter is conservative, `T` sits below its nominal χ²₆ distribution on an
-undisturbed mount. There were no false alarms in the 200 runs where it was armed and the
-model was right (README). When the model is *wrong* it fires repeatedly: in
-`time_offset_ignored` (an unmodelled 2.5 ms camera lag) it fires ~6 times per run. That is
+undisturbed mount. There were no false alarms in the 200 independent runs where it was armed
+and the model was right (`drift`, `time_offset`, `outliers`, `noise_misspecified`; README),
+nor before the knock in any of the 50 knock runs. When the model is *wrong* it fires repeatedly: in
+`time_offset_ignored` (an unmodelled 2.5 ms camera lag) it fires 3 times per run. That is
 the behaviour a self-checking calibrator should have.
 
 ## 8. Consistency, honestly
 
-* **Vision NIS per dof ≈ 1.00.** The pixel noise model matches the data, by construction once
-  it is estimated online (§4).
-* **Extrinsic NEES ≈ 2.0** against 6 expected on a stationary mount (2.7 with the random walk
-  switched off), so the filter is **conservative** by about 1.4–1.7× in σ. Every frame is used
+* **Vision NIS, in two parts.** Since the noise is estimated (§4), the innovation test is
+  split. The residual outside the range of `H`, over the noise in use, tests the noise level
+  alone; it is ≈ 1 almost by construction (0.983–0.987 in every campaign where it is estimated), so it only confirms the
+  estimator. The ≤ 28 compressed rows test `H P Hᵀ + R`, and their NIS is 0.986–0.991 per
+  dof. Once converged `H P Hᵀ` is small next to `R`, so that is a weak test of `P`: `knock`
+  (NEES 11) still shows 0.989, and `drift_frozen` (NEES 13 000) shows 1.03. The real
+  test of `P` is the NEES, which needs the truth and so exists only in simulation.
+* **Extrinsic NEES ≈ 1.9** against 6 expected on a stationary mount (2.5 with the random walk
+  switched off), so the filter is **conservative** by about 1.5–1.8× in σ. Every frame is used
   twice, as the "current" view of one update and the anchor of the next, so consecutive
   residuals share pixel noise with *negative* correlation. A filter that assumes independent
   residuals under-counts the information for slowly varying parameters such as the
   extrinsic. Fusing disjoint frame pairs only (`--set disjoint_pairs=1`, every observation used
-  once) brings NEES to 5.4, but discards half the data and doubles the error (p95 0.051° /
-  0.65 cm instead of 0.023° / 0.32 cm). The default keeps the accuracy and errs on the safe side.
+  once) brings NEES to 5.3, but discards half the data and doubles the error (p95 0.045° /
+  0.73 cm instead of 0.025° / 0.34 cm). The default keeps the accuracy and errs on the safe side.
+  (Both variants are in the README sensitivity checks.)
 * **Noise-free data with a perfect prior stays at truth** (1e-4° / 0.09 mm after 60 s). This
   is the regression test for model mismatches between the simulator and the estimator. During
   development it exposed a real one: `propagate()` took its first IMU sample by const
@@ -244,15 +299,30 @@ supervising process, can act on:
   the IMU frame. The rotation error is a camera-frame rotation vector, so its axis is rotated
   by `R_IC`.
 * **State.** *Converged* when the rotation and lever-arm bounds are inside 0.5° / 1 cm (the
-  acceptance criteria) and the time-offset bound is inside 1 ms. *Recalibrating* from a
-  detected knock until converged again.
-* **Why 2σ.** The covariance is conservative (NEES ≈ 2 against 6, §8), so a filter σ is about
-  1.7 true σ, and a 2σ filter bound is roughly 3.4 true σ. Across 300 runs of the scenarios
-  where the model holds, the status never claimed convergence while the true error was
-  outside the bounds. It certifies about 10 s after the true error gets inside (16 s against 6 s
-  at p50). A 3σ bound certified at 34 s and, with 2× pixel noise, not at all within 60 s,
-  for no gain in safety. A consistent covariance (a sliding window, so each observation is
-  used once) would call for re-tuning this choice.
+  acceptance criteria) and the time-offset bound is inside 1 ms.
+* **Why 2σ, and what it does not promise.** The bounds are `2 σ_max` of the filter, not
+  guarantees. Even a consistent filter would see the error norm beyond `2 σ_max` now and then:
+  for an isotropic 3-D Gaussian, `P(‖e‖ > 2σ) = P(χ²₃ > 4) ≈ 0.26`. The *converged* verdict
+  only asks for the bounds to be inside the 0.5° / 1 cm tolerance, and 2σ is enough for that
+  because the covariance is conservative (NEES ≈ 2 against 6, §8): a filter σ is about 1.8
+  true σ. In the evaluation (README), it never said *converged* while the true error was
+  outside tolerance in the 200 independent runs where the model holds and the mount is still
+  (`convergence`, `time_offset`, `outliers`, `noise_misspecified`), nor in the 10 min of drift
+  that the `drift` runs add after the same first minute. Against its own bounds the
+  record is weaker, as it should be for 2σ. The true error was outside them on 0.04 % of the
+  converged frames on a still mount, and on 1.3 % during the drift (the random walk lags it
+  slightly).
+* **How cautious.** In the nominal scenarios it certifies about 10 s after the true error gets
+  inside (16.3 s against 6.0 s, p50). With 2× pixel noise it certifies about 37 s after
+  (45.6 s against 8.1 s), because the larger noise keeps the covariance wide. A 3σ bound
+  certified at 34 s and, with 2× pixel noise, not at all within 60 s, for no gain in safety.
+* **The 2σ choice leans on the conservative covariance.** With disjoint frame pairs (NEES 5.3,
+  close to consistent), the same 2σ status made 240 false claims in 50 runs, and the true error
+  was outside its bounds on 12 % of the converged frames. A consistent covariance (a sliding
+  window, so each observation is used once) would need a larger multiplier.
+* **Recalibrating.** A detected knock sets the state to *recalibrating* until all three bounds
+  are inside tolerance again. In the evaluation, the frames between a knock and its detection
+  were the only false claims with the model otherwise right.
 * **Advice.** A direction `a` of the lever arm, or an axis `a` of the rotation, is invisible to
   rotation about `a` itself and observed only by rotation about the perpendicular axes. The
   filter keeps a running second moment `M` of the body rate (5 s time constant), so the

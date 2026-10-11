@@ -40,13 +40,16 @@ struct CalibratorConfig {
   /// Pixel noise, 1-sigma per coordinate [px]. With `adapt_pixel_noise` this is only the
   /// starting value: the filter rescales it to the noise it actually measures.
   double pixel_sigma = 0.5;
-  /// Estimate the pixel noise online. After the QR compression, the part of the stacked
-  /// residual that no state can explain is pure measurement noise with a known number of
-  /// degrees of freedom, so it measures the true noise level independently of the state
-  /// covariance. Its running average rescales `pixel_sigma`.
+  /// Estimate the pixel noise online, before the landmark gate: after a coarse screen for
+  /// gross mismatches (the gate at 10x the current sigma), the stacked residuals are projected
+  /// off every state direction (from the data alone, not from the covariance), and the median
+  /// per-landmark energy of what is left measures the true noise; the projection is repeated
+  /// without the landmarks far outside that level. The first frame sets the estimate and a
+  /// running mean follows it; it rescales `pixel_sigma` for the gate and the update.
   bool adapt_pixel_noise = true;
   int noise_adaptation_frames = 20;   ///< Averaging window of the noise estimate [frames]
-  double min_noise_scale = 0.1;       ///< Bounds on (adapted / configured variance) [-]
+  /// Bounds on (adapted / configured variance), i.e. 0.1x to 10x the configured sigma [-].
+  double min_noise_scale = 0.01;
   double max_noise_scale = 100.0;
   /// Per-landmark chi-squared gate on the 5-dof null-space residual (99.9 % = 20.5).
   double landmark_gate = 20.5;
@@ -90,10 +93,19 @@ struct CalibratorConfig {
   int change_window = 40;               ///< Updates in the test window (2 s at 20 Hz).
   double change_threshold = 40.0;       ///< Threshold on T (chi^2_6 tail 4.6e-7).
   /// 1-sigma the extrinsic covariance is re-opened to when a change is detected. Sized for a
-  /// knock, not for the initial CAD-level uncertainty: a much larger value makes the first
-  /// updates after the reset overshoot. A bigger change simply trips the detector again.
-  double reopen_rotation_sigma = 1.0 * constants::kDegToRad;  ///< [rad]
-  double reopen_translation_sigma = 0.01;                      ///< [m]
+  /// knock, not for the initial CAD-level uncertainty: 5 deg / 5 cm made the first updates
+  /// after the reset overshoot (3.8 deg after a 1.5 deg knock). 1 deg / 1 cm was too tight for
+  /// a 5 deg / 5 cm knock: the filter re-converged over-confident and the status re-certified a
+  /// lever arm still >1 cm off in 4 / 50 runs. 2 deg / 2 cm overshoots a 1.5 deg knock by up to
+  /// 0.5 deg, briefly, while the status says recalibrating.
+  double reopen_rotation_sigma = 2.0 * constants::kDegToRad;  ///< [rad]
+  double reopen_translation_sigma = 0.02;                      ///< [m]
+  /// Added (in quadrature) to the navigation states on a re-open: they were updated through
+  /// the wrong extrinsic between the change and its detection.
+  double reopen_attitude_sigma = 0.5 * constants::kDegToRad;   ///< [rad]
+  double reopen_velocity_sigma = 0.02;                         ///< [m/s]
+  double reopen_gyro_bias_sigma = 1.0e-3;                      ///< [rad/s]
+  double reopen_accel_bias_sigma = 0.05;                       ///< [m/s^2]
   /// The detector is armed only once the calibration has converged (every rotation and
   /// lever-arm sigma below these), so neither the initial convergence nor the re-convergence
   /// after a reset is mistaken for a knock.
@@ -118,10 +130,12 @@ struct CalibratorConfig {
 
   // --- Calibration status (see ExtrinsicCalibrator::status()) ---------------------
   /// The status bounds are this many filter sigmas along the least-certain direction [-].
-  /// 2 is enough because the filter covariance is conservative (NEES ~2 against 6, so a
-  /// filter sigma is ~1.7 true sigmas): in the evaluation the status never claimed
-  /// convergence with the true error outside the bounds, except between a knock and its
-  /// detection.
+  /// They are not guarantees: the true error can exceed them now and then. 2 is enough for
+  /// the converged verdict because the filter covariance is conservative (NEES ~2 against 6,
+  /// so a filter sigma is ~1.8 true sigmas): in the evaluation, wherever the model holds, the
+  /// status never said "converged" with the true error outside the converged bounds below,
+  /// except in the frames between a knock and its detection. 3 certified about twice as late.
+  /// With a near-consistent covariance (`disjoint_pairs`), 2 is not enough.
   double status_sigma_multiplier = 2.0;
   /// The calibration counts as converged once the bound along the least-certain direction
   /// is below these. The defaults are the acceptance criteria of the evaluation.
@@ -179,7 +193,12 @@ struct FrameReport {
   int used = 0;             ///< Landmarks that passed the gate and were fused.
   int gated = 0;            ///< Landmarks rejected by the gate.
   bool updated = false;     ///< True when an EKF update was applied.
-  double nis_per_dof = 0.0; ///< Normalised innovation squared per degree of freedom.
+  /// NIS per dof of the state-dependent (compressed) rows: tests the predicted covariance
+  /// \f$HPH^\top + R\f$, 1 for a consistent filter.
+  double nis_per_dof = 0.0;
+  /// Energy of the residual outside the range of H per dof, over the pixel variance in use:
+  /// tests the noise level alone (1 when the noise estimate is right).
+  double noise_check = 0.0;
   double noise_scale = 1.0; ///< Adapted / configured pixel-noise variance after this frame.
   double change_statistic = 0.0; ///< Change-detector statistic T (chi^2_6 under no change).
   bool change_detected = false;  ///< Change detector fired on this frame.
@@ -339,6 +358,7 @@ class ExtrinsicCalibrator {
 
   // Pixel-noise adaptation: adapted / configured variance.
   double noise_scale_ = 1.0;
+  bool noise_scale_initialised_ = false;  ///< First estimate replaces the configured value.
 
   // Running second moment of the bias-corrected body rate (excitation).
   Mat3 rate_moment_ = Mat3::Zero();
