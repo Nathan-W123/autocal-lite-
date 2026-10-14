@@ -50,6 +50,8 @@ SENSITIVITY = [
      "each observation used once (disjoint frame pairs): consistency vs accuracy"),
     ("no_random_walk", "convergence", ["rot_walk=0", "trans_walk=0"],
      "extrinsic random walk off on a stationary mount"),
+    ("gentle_motion", "convergence", ["roll_pitch_scale=0.2", "yaw_scale=0.5"],
+     "gentler motion: a fifth of the roll and pitch, half the yaw"),
     ("status_3sigma", "convergence", ["status_sigma=3"], "status bounds at 3 sigma instead of 2"),
     ("status_3sigma_noise", "noise_misspecified", ["status_sigma=3"],
      "3-sigma status with 2x the configured pixel noise"),

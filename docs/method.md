@@ -238,8 +238,8 @@ Two details make the re-open right, and the status's self-assessment (§9) is wh
   re-certified a lever arm still more than 1 cm off. Over 50 runs of a 5° / 5 cm knock, 1° / 1 cm gave
   283 false-claim frames after the detection, and 2° / 2 cm gives none. It also recovers
   faster: back in tolerance after 3.6 s instead of 8.2 s (p50), and 2.6 s for the 1.5° knock
-  (3.0 s with 1° / 1 cm). The price is some overshoot. After the 1.5° / 1.95 cm knock, the
-  rotation error peaks above the knock in 13 / 50 runs (at most 2.0°), and the lever arm
+  (3.0 s with 1° / 1 cm). The price is some overshoot. After the 1.5° / 1.97 cm knock, the
+  rotation error overshoots the knock by more than 0.1° in 8 / 50 runs (at most 2.0°), and the lever arm
   overshoots to 2.9 cm (p50; 2.2 cm with 1° / 1 cm) for a few seconds. Both happen while the
   status says *recalibrating*.
 * **The navigation states are loosened too.** Between the knock and its detection (0.2–0.4 s),

@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Targetless online stereo-IMU extrinsic calibration with drift tracking and knock recovery</title>
+<style>
+  @page { size: Letter; margin: 0.6in 0.65in; }
+  html, body { background: #fff; }
+  body { font-family: "Liberation Serif", "Times New Roman", Times, serif; color: #000;
+         font-size: 9.3pt; line-height: 1.2; margin: 0; text-align: justify; hyphens: auto; }
+  .title { text-align: center; font-size: 15pt; font-weight: 700; line-height: 1.2; margin: 0 0 5pt; }
+  .authors { text-align: center; font-size: 10pt; margin-bottom: 1pt; }
+  .affil { text-align: center; font-size: 8.8pt; font-style: italic; margin-bottom: 8pt; }
+  .abstract { margin: 0 0.3in 6pt; font-size: 8.8pt; }
+  .abstract b.lbl { display: block; text-align: center; font-size: 9.5pt; margin-bottom: 2pt; }
+  .kw { margin: 3pt 0 0; font-size: 8.6pt; }
+  .cols { column-count: 2; column-gap: 0.25in; }
+  h2 { font-size: 10pt; font-weight: 700; margin: 5pt 0 2pt; text-align: left; break-after: avoid; }
+  h3 { font-size: 9.6pt; font-weight: 700; font-style: italic; margin: 4pt 0 1.5pt; }
+  p { margin: 0 0 3.5pt; text-indent: 0; }
+  p + p { text-indent: 12pt; }
+  ul { margin: 0 0 3.5pt 12pt; padding: 0; }
+  li { margin: 0 0 1.2pt; }
+  figure { margin: 3pt 0 5pt; break-inside: avoid; text-align: center; }
+  figure img { width: 100%; }
+  figcaption { font-size: 8.3pt; text-align: justify; margin-top: 2pt; }
+  table { border-collapse: collapse; width: 100%; font-size: 8.4pt; margin: 2pt 0 2pt;
+          border-top: 1.2pt solid #000; border-bottom: 1.2pt solid #000; break-inside: avoid; }
+  th { border-bottom: 0.6pt solid #000; font-weight: 700; }
+  th, td { padding: 1.4pt 3pt; text-align: left; vertical-align: top; }
+  td.n, th.n { text-align: right; white-space: nowrap; }
+  .tcap { font-size: 8.3pt; margin: 3pt 0 1pt; text-align: justify; }
+  .page { page-break-after: always; }
+  .page:last-child { page-break-after: auto; }
+  .small { font-size: 9pt; }
+  .keep { break-inside: avoid; }
+  .appx table { font-size: 8.3pt; }
+</style>
+</head>
+<body>
+
+<div class="page">
+  <div class="title">Targetless Online Stereo&ndash;IMU Extrinsic Calibration<br>with Drift Tracking and Knock Recovery</div>
+  <div class="authors">Nathan Ward</div>
+  <div class="affil">University of California, Davis &nbsp;&middot;&nbsp; ncward@ucdavis.edu &nbsp;&middot;&nbsp;
+    <a href="https://github.com/Nathan-W123/autocal-lite-" style="color:inherit;text-decoration:none">github.com/Nathan-W123/autocal-lite-</a></div>
+
+  <div class="abstract">
+    <b class="lbl">Abstract</b>
+    Fusing a stereo camera with an IMU requires their extrinsic calibration, which is usually
+    measured with a target and an expert, and measured again whenever the mount shifts. This work
+    estimates it continuously from the rig&rsquo;s own motion instead. An error-state Kalman filter
+    in C++17 updates the extrinsic, the IMU biases and the camera&ndash;IMU time offset from
+    reprojection residuals of scene points that are triangulated and marginalised on the fly, so no
+    target or map is needed. The extrinsic is modelled as a slow random walk, a &chi;&sup2; test on
+    the filter&rsquo;s own corrections detects knocks, the pixel noise is estimated online, and a
+    status report says when the calibration can be trusted. In 50 simulated runs on a figure-eight
+    with roll, pitch and yaw, the filter reached 0.5&deg;&nbsp;/&nbsp;1&nbsp;cm from a
+    5&deg;&nbsp;/&nbsp;5&nbsp;cm error in every run (median 6&nbsp;s) and was within
+    0.03&deg;&nbsp;/&nbsp;0.41&nbsp;cm at 60&nbsp;s; it tracked a mount drifting 1&deg; over
+    10&nbsp;min to within 0.061&deg;, and was back within tolerance 2.6&nbsp;s (median) after a
+    1.5&deg;&nbsp;/&nbsp;2&nbsp;cm knock. All results are from simulation.
+    <div class="kw"><i>Keywords:</i> extrinsic calibration, visual&ndash;inertial sensing,
+      error-state Kalman filter, targetless calibration, change detection.</div>
+  </div>
+
+  <div class="cols">
+    <h2>1&nbsp;&nbsp;Introduction</h2>
+    <p>Visual&ndash;inertial systems need the rigid transform between camera and IMU: three rotation
+    and three lever-arm parameters. The aim here is a calibrator that runs while the rig operates,
+    follows slow drift, recovers from sudden changes, and reports whether its estimate is good
+    enough to use.</p>
+
+    <h2>2&nbsp;&nbsp;Method</h2>
+    <h3>2.1&nbsp;&nbsp;Filter and measurement</h3>
+    <p>The 28 error states are the IMU pose, velocity and biases, the extrinsic, the time offset,
+    and a clone of the previous frame&rsquo;s pose. The filter is adapted from the author&rsquo;s
+    Aether6 navigation filter, whose numerics, IMU noise models and Monte Carlo harness it reuses.
+    At each 20 Hz stereo frame, every point seen in the previous and the current frame is
+    triangulated and marginalised by projecting its eight pixel residuals onto the left null space
+    of its Jacobian, leaving five that depend only on the state. The analytic Jacobians, checked
+    numerically, include the time offset. A per-point &chi;&sup2; gate rejects wrong matches, and
+    about 500 rows are QR-compressed to 28 before a Joseph-form update.</p>
+    <h3>2.2&nbsp;&nbsp;Drift and knocks</h3>
+    <p>The extrinsic follows a random walk, so a drifting mount is followed rather than treated as
+    fixed. Once the calibration has converged, a knock shows up as corrections that keep pushing
+    one way: over 2 s, their sum is tested against its predicted covariance (statistic &gt; 40,
+    against &chi;&sup2;<sub>6</sub>). On detection the extrinsic covariance is re-opened to
+    2&deg; / 2 cm, and the navigation states are loosened too, since they absorbed part of the
+    knock before it was detected.</p>
+    <h3>2.3&nbsp;&nbsp;Self-tuning and self-assessment</h3>
+    <p>Projected off every state direction, the residual is pure pixel noise, so a robust estimate
+    of its level, taken before the gate, rescales the noise model. A status function reports
+    2&sigma; bounds along the least-certain directions, declares convergence when both are inside
+    0.5&deg; / 1 cm, and names the rotation that would observe a poorly observed direction.</p>
+
+    <h2>3&nbsp;&nbsp;Results</h2>
+    <p>Each run draws its own scene, true mount, IMU biases, noise and direction of the
+    5&deg; / 5 cm starting error; the estimator receives only that starting value (Table 1,
+    Fig. 1).</p>
+    <div class="keep"><div class="tcap"><b>Table 1.</b> Results over 50 runs per scenario (p50 = median).</div>
+    <table>
+      <tr><th>Scenario (target)</th><th>Result</th></tr>
+      <tr><td><b>Converge from 5&deg; / 5 cm</b> (&lt;&nbsp;0.5&deg;, &lt;&nbsp;1 cm in 60 s, &ge;&nbsp;95&nbsp;% of runs)</td>
+          <td><b>50 / 50</b>; p95 at 60 s 0.025&deg; / 0.34 cm</td></tr>
+      <tr><td><b>Drift 0.1&deg;/min for 10 min</b> (error &lt;&nbsp;0.3&deg;)</td>
+          <td><b>50 / 50</b>, worst 0.061&deg;; mount assumed fixed: 0.55&deg;</td></tr>
+      <tr><td>Knock, 1.5&deg; / 2 cm</td><td>detected 0.25 s, in tolerance 2.6 s (p50)</td></tr>
+      <tr><td>8 ms clock offset; 5&nbsp;% wrong matches; 2&times; pixel noise</td><td>50 / 50 converge in each</td></tr>
+    </table></div>
+    <figure>
+      <img src="fig_headline.png" alt="Convergence and drift tracking">
+      <figcaption><b>Figure 1.</b> Rotation error, 50 runs: median, p50&ndash;p95 band, maximum
+        (dotted). (a) Convergence. (b) From t = 60 s the mount drifts at 0.1&deg;/min; the same
+        filter with the mount assumed fixed falls behind. More in Appendix A.</figcaption>
+    </figure>
+    <p>In 200 runs on a still mount (nominal, clock offset, wrong matches, 2&times; noise) and
+    through the drift, the status never said <i>converged</i> with the true error outside
+    0.5&deg; / 1 cm. It certified about 10 s after the truth got inside (36 s with 2&times; noise).
+    The change detector raised no false alarm in 200 runs (11.7 h of data).</p>
+
+    <h2>4&nbsp;&nbsp;Limitations and Next Steps</h2>
+    <p>The data are simulated: an ideal pinhole stereo pair, given correspondences and known IMU
+    noise. The motion matters: with a fifth of the roll and pitch and half the yaw, the lever arm
+    reaches 1 cm in only 34 / 50 runs (median 50 s), and the status, correctly, certifies none. The
+    covariance is conservative (NEES 1.9 against 6), which the 2&sigma; status relies on; a short
+    sliding window of poses would make it consistent and add information under gentle motion.
+    Validation on recorded data is next.</p>
+  </div>
+</div>
+
+<div class="page appx">
+  <h2>Appendix A&nbsp;&nbsp;Convergence and Knock Recovery</h2>
+  <figure>
+    <img src="fig_convergence.png" alt="Convergence of rotation and lever arm">
+    <figcaption><b>Figure A1.</b> Convergence from a 5&deg; / 5 cm starting error, 50 runs: median
+      (line), p50&ndash;p95 band and maximum (dotted). The lever arm is the slower part: at 60 s its
+      error is 0.15 cm (p50) and 0.40 cm in the worst run.</figcaption>
+  </figure>
+  <figure>
+    <img src="fig_knock.png" alt="Recovery from a knock">
+    <figcaption><b>Figure A2.</b> A 1.5&deg; / 2 cm (1.97 cm) knock at 90 s, 50 runs, sampled every
+      0.5 s. With the change detector (blue: median, p50&ndash;p95 band, maximum) the knock is
+      detected after 0.25 s (p50; 0.40 s at most) and the estimate is back in tolerance after 2.6 s
+      (p50). Taken run by run, the lever-arm error peaks at 2.9 cm (median over runs) during
+      re-convergence, and in 8 runs the rotation overshoots the knock by more than 0.1&deg;
+      (2.0&deg; at most); the plotted curves peak lower because these peaks fall between samples.
+      Throughout, the status reports <i>recalibrating</i>. Without the detector (orange, median)
+      the random walk recovers the rotation slowly, and the lever arm is still 1.05 cm off at
+      180 s.</figcaption>
+  </figure>
+
+  <h2>Appendix B&nbsp;&nbsp;Self-Assessment and Sensitivity</h2>
+  <p>A <i>false claim</i> is a frame on which the status says <i>converged</i> while the true error
+  is outside 0.5&deg; / 1 cm. The 2&sigma; bounds are filter sigmas, not guarantees; the true error
+  exceeded them on 0&ndash;0.04&nbsp;% of the converged frames on a still mount and on 1.3&nbsp;% during the
+  drift.</p>
+  <div class="tcap"><b>Table B1.</b> Self-assessment, 50 runs per scenario. &ldquo;Converged&rdquo; is
+    the true error inside 0.5&deg; / 1 cm at 60 s; &ldquo;status&rdquo; is what the filter reported.</div>
+  <table>
+    <tr><th>Scenario</th><th class="n">Converged</th><th class="n">Status says converged</th><th class="n">Status certified (p50)</th><th class="n">Truth inside (p50)</th><th class="n">False claims</th></tr>
+    <tr><td>Nominal, clock offset, wrong matches</td><td class="n">150 / 150</td><td class="n">150 / 150</td><td class="n">16.3&ndash;17.0 s</td><td class="n">6.0&ndash;6.4 s</td><td class="n">0</td></tr>
+    <tr><td>Pixel noise 2&times; configured, estimated</td><td class="n">50 / 50</td><td class="n">50 / 50</td><td class="n">45.6 s</td><td class="n">8.1 s</td><td class="n">0</td></tr>
+    <tr><td>Drift, 10 min at 0.1&deg;/min</td><td class="n">50 / 50</td><td class="n">50 / 50</td><td class="n">16.3 s</td><td class="n">6.0 s</td><td class="n">0</td></tr>
+    <tr><td>Yaw-only motion</td><td class="n">5 / 50</td><td class="n">0 / 50</td><td class="n">&ndash;</td><td class="n">&ndash;</td><td class="n">0</td></tr>
+    <tr><td>Knock (all before detection)</td><td class="n">50 / 50</td><td class="n">50 / 50</td><td class="n">16.3 s</td><td class="n">6.0 s</td><td class="n">253</td></tr>
+    <tr><td>Noise estimation off (model wrong)</td><td class="n">33 / 50</td><td class="n">49 / 50</td><td class="n">22.8 s</td><td class="n">29.3 s (33 runs)</td><td class="n">15&thinsp;166</td></tr>
+    <tr><td>Clock offset ignored (model wrong)</td><td class="n">21 / 50</td><td class="n">0 / 50</td><td class="n">&ndash;</td><td class="n">&ndash;</td><td class="n">455</td></tr>
+  </table>
+  <div class="tcap"><b>Table B2.</b> Sensitivity checks: same 50 seeds, one setting changed.</div>
+  <table>
+    <tr><th>Change</th><th>Result</th></tr>
+    <tr><td>Gentler motion: a fifth of the roll and pitch, half the yaw</td>
+        <td>34 / 50 converge (median 50 s; lever arm 0.88 cm p50 at 60 s); the status certifies none, 0 false claims</td></tr>
+    <tr><td>Pixel noise configured 10&times; too low or too high, with or without 5&nbsp;% wrong matches</td>
+        <td>50 / 50 converge in all four, unchanged accuracy, 0 false claims; noise estimated as 0.491&ndash;0.513 px (10&times; is the limit of the estimate&rsquo;s range)</td></tr>
+    <tr><td>Status at 3&sigma; instead of 2&sigma;</td><td>certifies at 34.1 s instead of 16.3 s; never within 60 s with 2&times; noise</td></tr>
+    <tr><td>Each observation used once (disjoint frame pairs)</td><td>NEES 5.3 (near consistent) but twice the error; the 2&sigma; status makes 240 false claims</td></tr>
+    <tr><td>5&deg; / 5 cm knock</td><td>back in tolerance after 3.6 s (p50); 75 false claims, all before detection</td></tr>
+  </table>
+</div>
+
+<div class="page appx small">
+  <h2>Appendix C&nbsp;&nbsp;Implementation</h2>
+  <p><b>Estimator and simulator (C++17, Eigen).</b> Adapted from Aether6: its 18-state navigation
+  filter became the 28-state calibrator. Reused from Aether6: rotation algebra, discretisation,
+  the error-state filter numerics (Joseph-form update, multiplicative attitude reset), IMU
+  white-noise and bias random-walk models, and the deterministic multi-threaded Monte Carlo harness.
+  New: a stereo camera with a landmark scene and a true mount that drifts or is knocked; a scripted
+  figure-eight trajectory with roll, pitch and yaw excitation; the reprojection model with analytic
+  Jacobians; the change detector, noise estimate and status; and the scenarios. No ROS.</p>
+  <p><b>Verification.</b> 117 Catch2 test cases: Jacobians against central differences, a
+  noise-free run that must stay at the truth, propagation order of accuracy, bit-for-bit
+  reproducibility from a seed, and end-to-end scenario checks. CI builds with GCC and Clang
+  (Release, warnings as errors) and runs a Debug subset with Eigen&rsquo;s assertions on. GCC and
+  Clang (both with libstdc++) produce identical runs. <code>make eval</code> regenerates every
+  Monte Carlo result here, and <code>docs/writeup/make_figures.py</code> the figures; the
+  development history in Appendix D is documented in <code>docs/method.md</code>.</p>
+
+  <h2>Appendix D&nbsp;&nbsp;Evaluation Protocol and Negative Results</h2>
+  <ul>
+    <li>The estimator never sees the truth; all scoring against it happens outside the filter. Seeds
+      derive from one master seed, so any run can be reproduced exactly.</li>
+    <li>The noise-free regression test exposed a propagation bug: the first IMU sample of each step
+      was read by reference after being overwritten, a hidden 2.5 ms time shift that, before the
+      clock offset was estimated, caused a 0.3&deg; systematic error during convergence.</li>
+    <li>Without clock-offset estimation, an unmodelled 2.5 ms camera&ndash;IMU offset biases the
+      lever arm by about 1 cm (1.07 cm p50) and only 21 / 50 runs converge, so the offset is always
+      estimated.</li>
+    <li>The first noise estimate was taken after the gate. With the noise configured four or more
+      times too low, the gate rejected the data that would have corrected it and the covariance
+      collapsed. Measuring before the gate fixed that; wrong correspondences then inflated even the
+      median through the projection, which a coarse pre-screen and a trimmed repeat fixed.</li>
+    <li>After a knock, re-opening only the extrinsic let the status re-certify a lever arm still
+      more than 1 cm off (135 frames over 50 runs), and a 1&deg; / 1 cm re-open did the same for a
+      5&deg; / 5 cm knock (283 frames). Loosening the navigation states and re-opening to
+      2&deg; / 2 cm removed both.</li>
+    <li>Using each observation once makes the covariance nearly consistent but doubles the error
+      (p95 0.045&deg; / 0.73 cm against 0.025&deg; / 0.34 cm), which is why the sliding window in
+      Section 4 is the next step rather than simply dropping half the data.</li>
+  </ul>
+</div>
+
+</body>
+</html>

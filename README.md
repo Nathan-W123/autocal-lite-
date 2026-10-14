@@ -34,7 +34,7 @@ Supplementary scenarios (same 50 seeds):
 | `noise_misspecified` | pixels are twice as noisy as configured (1.0 px vs 0.5 px) | 50 / 50 converge (p95 0.027° / 0.52 cm): the filter measures the real noise online (1.005 px, p50) and its covariance stays conservative (NEES 1.4) |
 | `noise_misspecified_fixed` | same, noise estimation switched off | **33 / 50 converge** (p95 0.075° / 1.39 cm), NEES 23: confidently wrong |
 | `outliers` | 5 % of the correspondences are wrong | 50 / 50 converge (p95 0.027° / 0.29 cm); the per-landmark χ² gate removes them |
-| `knock` | the mount is knocked by 1.5° / 1.95 cm at t = 90 s | the change detector fires exactly once in every run, 0.25 s after the knock (p50; 0.40 s worst). Back under 0.5° and 1 cm after 2.6 s (p50) / 5.1 s (p95), 0.012° / 0.12 cm at 180 s. While it re-converges the lever arm overshoots to 2.9 cm (p50), and in 13 runs the rotation briefly exceeds the knock (2.0° worst) |
+| `knock` | the mount is knocked by 1.5° / 1.97 cm at t = 90 s | the change detector fires exactly once in every run, 0.25 s after the knock (p50; 0.40 s worst). Back under 0.5° and 1 cm after 2.6 s (p50) / 5.1 s (p95), 0.012° / 0.12 cm at 180 s. While it re-converges the lever arm overshoots to 2.9 cm (p50), and in 8 runs the rotation briefly overshoots the knock by more than 0.1° (2.0° worst) |
 | `knock_no_detector` | same knock, detector off | the random walk recovers the rotation but not the lever arm: still 1.05 cm off at 180 s (11 / 50 back under 1 cm) |
 | `yaw_only` | roll and pitch excitation removed | 5 / 50 converge: the lever arm along the yaw axis is unobservable (3.1 cm p50 error), exactly as the theory predicts |
 | false alarms | change detector in every run where it is armed and the model is right (`drift`, `time_offset`, `outliers`, `noise_misspecified`) | **0 in 200 runs** (≈ 11.7 h of simulated data), and none before the knock in the 50 `knock` runs. In `yaw_only` it never arms, because the filter knows its lever arm has not converged |
@@ -64,7 +64,7 @@ tolerance.
 | `noise_misspecified` (2× pixel noise, estimated) | 50 / 50 | 45.6 s | 8.1 s | **0** | 0 % |
 | `drift` (10 min at 0.1°/min) | 50 / 50 | 16.3 s | 6.0 s | **0** | 1.3 % (the random walk lags the drift slightly) |
 | `yaw_only` | 0 / 50 (correct: the lever arm is not observable) | – | – | **0** | – |
-| `knock` (1.5° / 1.95 cm at 90 s) | 50 / 50 | 16.3 s | 6.0 s | 253, all between a knock and its detection (0.25 s p50); none after | 0.18 % |
+| `knock` (1.5° / 1.97 cm at 90 s) | 50 / 50 | 16.3 s | 6.0 s | 253, all between a knock and its detection (0.25 s p50); none after | 0.18 % |
 | `noise_misspecified_fixed` (noise estimation off) | 49 / 50 | 22.8 s | 29.3 s | 15 166: why the noise must be estimated | 82 % |
 | `time_offset_ignored` (timing model wrong) | 0 / 50 | – | – | 455 | 50 % |
 
